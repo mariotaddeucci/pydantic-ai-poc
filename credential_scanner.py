@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.usage import UsageLimits
 
 from config import settings
 
@@ -218,32 +219,16 @@ class ScanDeps:
     blocks: list[ContextBlock]
 
 
-def _read_range(file_path: str, start_line: int, end_line: int) -> str:
-    """Read a range of lines from a file, formatting them with line numbers."""
-    p = Path(file_path)
-    if not p.exists():
-        return f"[File not found: {file_path}]"
-    raw = p.read_text(encoding="utf-8", errors="replace").split("\n")
-
-    s = max(0, start_line - 1)
-    e = min(len(raw), end_line)
-    parts: list[str] = []
-    for i in range(s, e):
-        parts.append(f"{i + 1:4d}: {raw[i].rstrip()}")
-    return "\n".join(parts)
-
-
 agent = Agent(
     deps_type=ScanDeps,
     output_type=ScanReport,
     system_prompt=(
         "You are a senior security auditor specializing in credential leak detection. "
-        "You receive a pre-built report with code snippets flagged by static analysis tools. "
-        "Your only job is to classify each finding.\n\n"
-        "For each code block in the report, review the snippet (flagged lines are marked "
-        "with '>>>') and determine whether each finding is a false_positive, exposed, "
-        "or uncertain. If the pre-assembled context is insufficient, use the "
-        "`read_file_range` tool to expand the view.\n\n"
+        "You receive a pre-built mini report with code snippets flagged by static "
+        "analysis tools. Your only job is to classify each finding.\n\n"
+        "For each code block in the report, review the snippet (flagged lines are "
+        "marked with '>>>') and determine whether each finding is a "
+        "false_positive, exposed, or uncertain.\n\n"
         "Classification criteria:\n"
         "- **false_positive**: The value is clearly a test mock, placeholder, "
         "example from documentation, empty string, or references an env var / settings "
@@ -259,20 +244,74 @@ agent = Agent(
 )
 
 
-@agent.tool
-async def read_file_range(
-    ctx: RunContext[ScanDeps], file_path: str, start_line: int, end_line: int
-) -> str:
-    """Read a specific line range from a file to get more context."""
-    return _read_range(file_path, start_line, end_line)
-
-
 # ── Main ──────────────────────────────────────────────────────────────
+
+BATCH_SIZE = 5  # files per agent run
 
 # Registry of tool adapters — add new tools here
 TOOL_RUNNERS: list[tuple[str, Any]] = [
     ("ruff", run_ruff),
 ]
+
+
+def _merge_reports(reports: list[ScanReport], directory: str) -> ScanReport:
+    merged = ScanReport(directory=directory)
+    for r in reports:
+        merged.total_findings += r.total_findings
+        merged.false_positives += r.false_positives
+        merged.exposed += r.exposed
+        merged.uncertain += r.uncertain
+        merged.findings.extend(r.findings)
+    return merged
+
+
+def _format_prompt_from_blocks(blocks: list[ContextBlock], directory: str) -> str:
+    blocks_text: list[str] = []
+    for i, b in enumerate(blocks, 1):
+        tools = {f.tool_name for f in b.findings}
+        rules = {f.rule_id for f in b.findings}
+        flagged = ", ".join(str(ln) for ln in b.finding_lines)
+        blocks_text.append(
+            f"## Block {i}\n"
+            f"**File:** `{b.file_path}` | **Lines:** {b.start_line}-{b.end_line} | "
+            f"**Flagged:** {flagged}\n"
+            f"**Tools:** {', '.join(sorted(tools))} | **Rules:** {', '.join(sorted(rules))}\n\n"
+            f"**Findings:**\n" +
+            "\n".join(f"- [{f.rule_id}] line {f.line_number}: {f.description}" for f in b.findings) +
+            f"\n\n```\n{b.snippet}\n```\n"
+        )
+    return (
+        f"Analyse the following security scan results from directory `{directory}`.\n\n"
+        + "\n".join(blocks_text) +
+        "\n\nFor each finding, classify it as false_positive, exposed, or uncertain. "
+        "Include your reasoning for each classification."
+    )
+
+
+async def _analyse_batch(
+    batch_files: list[str],
+    all_findings: list[RawFinding],
+    model: OpenAIChatModel,
+    directory: str,
+) -> ScanReport:
+    """Run the agent on a single batch of files (5 or fewer)."""
+    batch_set = set(batch_files)
+    batch_findings = [f for f in all_findings if f.file_path in batch_set]
+
+    blocks = build_context_blocks(batch_findings)
+    prompt = _format_prompt_from_blocks(blocks, directory)
+    deps = ScanDeps(directory=directory, blocks=blocks)
+
+    result = await agent.run(
+        prompt,
+        deps=deps,
+        model=model,
+        model_settings=OpenAIChatModelSettings(
+            extra_body={"thinking": {"type": "disabled"}}
+        ),
+        usage_limits=UsageLimits(request_limit=200),
+    )
+    return result.output
 
 
 async def main():
@@ -286,6 +325,7 @@ async def main():
     directory = sys.argv[1] if len(sys.argv) > 1 else "."
     print(f"Scanning directory: {directory}")
 
+    # Phase 1: run external tools
     all_findings: list[RawFinding] = []
     for tool_name, runner in TOOL_RUNNERS:
         print(f"  Running {tool_name}...")
@@ -301,64 +341,45 @@ async def main():
         print("No security issues found.")
         return
 
-    # Pre-context phase
-    print("Building context blocks...")
-    blocks = build_context_blocks(all_findings)
-    print(f"  Merged into {len(blocks)} block(s)")
-
-    # Build prompt
-    blocks_text = []
-    for i, b in enumerate(blocks, 1):
-        tools = {f.tool_name for f in b.findings}
-        rules = {f.rule_id for f in b.findings}
-        flagged = ", ".join(str(ln) for ln in b.finding_lines)
-        blocks_text.append(
-            f"## Block {i}\n"
-            f"**File:** `{b.file_path}` | **Lines:** {b.start_line}-{b.end_line} | "
-            f"**Flagged:** {flagged}\n"
-            f"**Tools:** {', '.join(sorted(tools))} | **Rules:** {', '.join(sorted(rules))}\n\n"
-            f"**Findings:**\n" +
-            "\n".join(f"- [{f.rule_id}] line {f.line_number}: {f.description}" for f in b.findings) +
-            f"\n\n```\n{b.snippet}\n```\n"
-        )
-
-    prompt = (
-        f"Analyse the following security scan results from directory `{directory}`.\n\n"
-        + "\n".join(blocks_text) +
-        "\n\nFor each finding, classify it as false_positive, exposed, or uncertain. "
-        "Include your reasoning for each classification."
-    )
+    # Phase 2: group by file and split into batches
+    files_flagged = list(dict.fromkeys(f.file_path for f in all_findings))
+    batches = [files_flagged[i:i + BATCH_SIZE] for i in range(0, len(files_flagged), BATCH_SIZE)]
 
     provider = OpenAIProvider(
         base_url=settings.opencode_base_url,
         api_key=settings.opencode_api_key,
     )
-    model = OpenAIChatModel(settings.opencode_model, provider=provider)
-    deps = ScanDeps(directory=directory, blocks=blocks)
+    model = OpenAIChatModel(settings.opencode_model_light, provider=provider)
 
-    result = await agent.run(
-        prompt,
-        deps=deps,
-        model=model,
-        model_settings=OpenAIChatModelSettings(
-            extra_body={"thinking": {"type": "disabled"}}
-        ),
-    )
+    print(f"\nFiles flagged: {len(files_flagged)}")
+    print(f"Batches: {len(batches)} ({BATCH_SIZE} files each)")
 
-    report = result.output
-    print(f"\n=== SCAN REPORT ===")
-    print(f"Directory: {report.directory}")
-    print(f"Total: {report.total_findings}")
-    print(f"False positives: {report.false_positives}")
-    print(f"Exposed: {report.exposed}")
-    print(f"Uncertain: {report.uncertain}")
-    print(f"\n--- Findings ---")
-    for f in report.findings:
+    # Phase 3: process each batch through the agent
+    reports: list[ScanReport] = []
+    for i, batch in enumerate(batches, 1):
+        print(f"\n  Batch {i}/{len(batches)} — {len(batch)} file(s)")
+        for f in batch:
+            print(f"    {f}")
+        report = await _analyse_batch(batch, all_findings, model, directory)
+        reports.append(report)
+        print(f"    → {report.total_findings} analysed, "
+              f"exposed={report.exposed}, uncertain={report.uncertain}, "
+              f"false_positives={report.false_positives}")
+
+    # Phase 4: merge and print
+    final = _merge_reports(reports, directory)
+    print(f"\n{'=' * 60}")
+    print(f"FINAL SCAN REPORT — {final.directory}")
+    print(f"{'=' * 60}")
+    print(f"Total findings: {final.total_findings}")
+    print(f"  Exposed:         {final.exposed}")
+    print(f"  Uncertain:       {final.uncertain}")
+    print(f"  False positives: {final.false_positives}")
+    print(f"\n--- Detailed findings ---")
+    for f in final.findings:
         print(f"\n[{f.assessment.upper()}] {f.file_path}:{f.line_number} [{f.rule_id}]")
         print(f"  Reasoning: {f.reasoning}")
         print(f"  Context:\n{f.context}")
-
-    print(f"\nUsage: {result.usage}")
 
 
 if __name__ == "__main__":
