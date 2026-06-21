@@ -45,7 +45,11 @@ def _format_snippet(lines: list[str], start: int, end: int, flagged: set[int]) -
 
 
 def build_context_blocks(findings: list[RawFinding]) -> list[ContextBlock]:
-    """Pre-context phase: read files, expand windows, merge overlapping blocks."""
+    """Pre-context phase: one ContextBlock per finding, no merging.
+
+    Each finding gets its own ±3 non-blank-line window. Blocks are
+    ordered by file path, then line number.
+    """
     findings_sorted = sorted(findings, key=lambda f: (f.file_path, f.line_number))
     blocks: list[ContextBlock] = []
 
@@ -55,30 +59,16 @@ def build_context_blocks(findings: list[RawFinding]) -> list[ContextBlock]:
             continue
         lines = p.read_text(encoding="utf-8", errors="replace").split("\n")
 
-        file_findings = list(group)
-        windows: list[tuple[int, int, set[int], list[RawFinding]]] = []
-        for f in file_findings:
+        for f in list(group):
             center = f.line_number - 1
             s, e = _non_blank_window(lines, center, CONTEXT_LINES)
-            windows.append((s, e, {f.line_number}, [f]))
-
-        windows.sort(key=lambda w: w[0])
-        merged: list[tuple[int, int, set[int], list[RawFinding]]] = []
-        for s, e, fl, fg in windows:
-            if merged and s <= merged[-1][1]:
-                prev_s, prev_e, prev_fl, prev_fg = merged.pop()
-                merged.append((prev_s, max(prev_e, e), prev_fl | fl, prev_fg + fg))
-            else:
-                merged.append((s, e, fl, fg))
-
-        for s, e, fl, fg in merged:
-            snippet = _format_snippet(lines, s, e, fl)
+            snippet = _format_snippet(lines, s, e, {f.line_number})
             blocks.append(ContextBlock(
                 file_path=str(p),
                 start_line=s + 1,
                 end_line=e,
-                finding_lines=sorted(fl),
-                findings=fg,
+                finding_lines=[f.line_number],
+                findings=[f],
                 snippet=snippet,
             ))
 
@@ -93,9 +83,10 @@ def build_markdown_report(
     directory: str,
     tools_used: list[str],
 ) -> str:
-    """Generate a self-contained markdown report for first-level human review."""
+    """Generate a per-file markdown report — one section per file, one block per finding."""
+    from itertools import groupby as _groupby
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    total = sum(len(b.findings) for b in blocks)
     files_flagged = len({b.file_path for b in blocks})
 
     lines = [
@@ -105,40 +96,49 @@ def build_markdown_report(
         f"**Generated:** {now}  ",
         f"**Tools:** {', '.join(tools_used)}  ",
         f"**Files flagged:** {files_flagged}  ",
-        f"**Findings:** {total}  ",
+        f"**Findings:** {len(blocks)}  ",
         f"",
         f"---",
         f"",
     ]
 
-    for i, b in enumerate(blocks, 1):
-        rules = {f.rule_id for f in b.findings}
-        flagged = ", ".join(str(ln) for ln in b.finding_lines)
-        lines.extend([
-            f"### {i}. `{b.file_path}`",
-            f"",
-            f"| Campo | Valor |",
-            f"|-------|-------|",
-            f"| **Linhas do bloco** | {b.start_line}–{b.end_line} |",
-            f"| **Linhas flagadas** | {flagged} |",
-            f"| **Regras** | {', '.join(sorted(rules))} |",
-            f"",
-            f"**Ocorrências:**",
-            f"",
-        ])
-        for f in b.findings:
-            lines.append(f"- `[{f.rule_id}]` linha **{f.line_number}** — {f.description}")
-        lines.extend([
-            f"",
-            f"```",
-            b.snippet,
-            f"```",
-            f"",
-            f"---",
-            f"",
-        ])
+    blocks_sorted = sorted(blocks, key=lambda b: (b.file_path, b.start_line))
+    for file_path, group in _groupby(blocks_sorted, key=lambda b: b.file_path):
+        file_blocks = list(group)
+        name = Path(file_path).name
+        lines.append(f"## {name}")
+        lines.append(f"")
+        lines.append(f"*`{file_path}`*")
+        lines.append(f"")
+
+        for b in file_blocks:
+            f = b.findings[0]  # one finding per block
+            lines.extend([
+                f"### Linha {f.line_number} — `[{f.rule_id}]` {_rule_label(f.rule_id)}",
+                f"",
+                f"**{f.description}**",
+                f"",
+                f"```",
+                b.snippet,
+                f"```",
+                f"",
+            ])
+
+        lines.append(f"---")
+        lines.append(f"")
 
     return "\n".join(lines)
+
+
+_RULE_LABELS: dict[str, str] = {
+    "S105": "hardcoded-password-string",
+    "S106": "hardcoded-password-func-arg",
+    "S107": "hardcoded-password-default",
+}
+
+
+def _rule_label(rule_id: str) -> str:
+    return _RULE_LABELS.get(rule_id, rule_id)
 
 
 def append_analysis_to_markdown(md_path: str, report: ScanReport) -> None:
