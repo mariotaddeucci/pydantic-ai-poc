@@ -218,16 +218,32 @@ class ScanDeps:
     blocks: list[ContextBlock]
 
 
+def _read_range(file_path: str, start_line: int, end_line: int) -> str:
+    """Read a range of lines from a file, formatting them with line numbers."""
+    p = Path(file_path)
+    if not p.exists():
+        return f"[File not found: {file_path}]"
+    raw = p.read_text(encoding="utf-8", errors="replace").split("\n")
+
+    s = max(0, start_line - 1)
+    e = min(len(raw), end_line)
+    parts: list[str] = []
+    for i in range(s, e):
+        parts.append(f"{i + 1:4d}: {raw[i].rstrip()}")
+    return "\n".join(parts)
+
+
 agent = Agent(
     deps_type=ScanDeps,
     output_type=ScanReport,
     system_prompt=(
         "You are a senior security auditor specializing in credential leak detection. "
-        "Your task is to analyse code blocks flagged by static analysis tools and "
-        "classify each finding.\n\n"
-        "Each block you receive already contains the surrounding code context. "
-        "Review the snippet, identify the flagged lines (marked with '>>>'), and "
-        "determine whether each finding is a false_positive, exposed, or uncertain.\n\n"
+        "You receive a pre-built report with code snippets flagged by static analysis tools. "
+        "Your only job is to classify each finding.\n\n"
+        "For each code block in the report, review the snippet (flagged lines are marked "
+        "with '>>>') and determine whether each finding is a false_positive, exposed, "
+        "or uncertain. If the pre-assembled context is insufficient, use the "
+        "`read_file_range` tool to expand the view.\n\n"
         "Classification criteria:\n"
         "- **false_positive**: The value is clearly a test mock, placeholder, "
         "example from documentation, empty string, or references an env var / settings "
@@ -236,33 +252,19 @@ agent = Agent(
         "with actual values that look like real tokens, passwords, or API keys.\n"
         "- **uncertain**: The context is ambiguous — it could be a real secret or a "
         "test/mock but you cannot determine with confidence.\n\n"
-        "For each finding, provide your assessment and reasoning."
+        "IMPORTANT: Analyse every finding listed in the report. Do not skip any. "
+        "Provide assessment and reasoning for each one."
     ),
     defer_model_check=True,
 )
 
 
 @agent.tool
-async def list_blocks(ctx: RunContext[ScanDeps]) -> str:
-    """List all code blocks to be analysed with their pre-assembled context."""
-    if not ctx.deps.blocks:
-        return "No code blocks to analyse."
-    parts = []
-    for i, b in enumerate(ctx.deps.blocks, 1):
-        tools = {f.tool_name for f in b.findings}
-        rules = {f.rule_id for f in b.findings}
-        flagged = ", ".join(str(ln) for ln in b.finding_lines)
-        parts.append(
-            f"--- Block {i} ---\n"
-            f"File: {b.file_path}\n"
-            f"Lines: {b.start_line}-{b.end_line} (flagged: {flagged})\n"
-            f"Tools: {', '.join(sorted(tools))}\n"
-            f"Rules: {', '.join(sorted(rules))}\n"
-            f"Descriptions:\n" +
-            "\n".join(f"  [{f.rule_id}] line {f.line_number}: {f.description}" for f in b.findings) +
-            f"\n\nSnippet:\n{b.snippet}\n"
-        )
-    return "\n".join(parts)
+async def read_file_range(
+    ctx: RunContext[ScanDeps], file_path: str, start_line: int, end_line: int
+) -> str:
+    """Read a specific line range from a file to get more context."""
+    return _read_range(file_path, start_line, end_line)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
