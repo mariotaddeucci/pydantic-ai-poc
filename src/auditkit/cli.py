@@ -14,7 +14,8 @@ from pathlib import Path
 
 import typer
 
-from auditkit.agent_classifier import BATCH_SIZE, classify_batch, merge_reports
+from auditkit.agents import classify_batch as agent_classify_batch
+from auditkit.agents import get_agent, list_agents, merge_reports
 from auditkit.config import settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
 from auditkit.providers import AVAILABLE_PROVIDERS, PROFILE_RULES
@@ -175,18 +176,29 @@ def report(
 def analyze(
     jsonl_file: str | None = typer.Argument(None, help="JSONL file from the scan command (or stdin)"),
     directory: str | None = typer.Option(None, "--directory", "-d", help="Override report directory label"),
+    agent: str = typer.Option(
+        settings.openai_default_agent,
+        "--agent",
+        "-a",
+        help=f"Agent context to use. Available: {', '.join(list_agents())}",
+    ),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress status output, print only JSON"),
 ):
-    """Analyze JSONL scan results with the AI agent.
+    """Analyze JSONL scan results with the selected AI security agent.
 
     Reads findings from a JSONL file (or stdin), groups by file, runs the
-    DeepSeek V4 Flash agent in batches of 5 files, and prints the final
-    ScanReport as JSON to stdout.
+    chosen agent in batches, and prints the final ScanReport as JSON to stdout.
     """
-    if not settings.opencode_api_key:
-        _err("Erro: OPENCODE_API_KEY nao definida.")
-        _err("Copie .env.example para .env e preencha sua chave do OpenCode Go.")
+    if not settings.openai_api_key:
+        _err("Erro: OPENAI_API_KEY nao definida.")
+        _err("Copie .env.example para .env e preencha sua chave da OpenAI.")
         raise typer.Exit(1)
+
+    try:
+        agent_instance = get_agent(agent).create()
+    except ValueError as e:
+        _err(f"Error: {e}")
+        raise typer.Exit(2) from e
 
     entries = _read_jsonl(jsonl_file)
     all_findings = [e.finding for e in entries]
@@ -194,12 +206,14 @@ def analyze(
 
     if not quiet:
         _err(f"Loaded {len(all_findings)} findings")
+        _err(f"Agent: {agent_instance.name} — {agent_instance.description}")
 
     files_flagged = list(dict.fromkeys(f.file_path for f in all_findings))
-    batches = [files_flagged[i : i + BATCH_SIZE] for i in range(0, len(files_flagged), BATCH_SIZE)]
+    batch_size = agent_instance.batch_size
+    batches = [files_flagged[i : i + batch_size] for i in range(0, len(files_flagged), batch_size)]
     if not quiet:
         _err(f"Files flagged: {len(files_flagged)}")
-        _err(f"Batches: {len(batches)} ({BATCH_SIZE} files each)")
+        _err(f"Batches: {len(batches)} ({batch_size} files each)")
 
     async def _run():
         reports: list[ScanReport] = []
@@ -214,7 +228,7 @@ def analyze(
                 for bf in batch_files:
                     _err(f"    {bf}")
 
-            report = await classify_batch(batch_blocks, dir_label)
+            report = await agent_classify_batch(agent_instance, batch_blocks, dir_label)
             reports.append(report)
             if not quiet:
                 _err(

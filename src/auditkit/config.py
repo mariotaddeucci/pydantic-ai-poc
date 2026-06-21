@@ -8,10 +8,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    opencode_api_key: str = ""
-    opencode_base_url: str = "https://opencode.ai/zen/go/v1"
-    opencode_model: str = "deepseek-v4-pro"
-    opencode_model_light: str = "deepseek-v4-flash"
+    openai_api_key: str = ""
+    openai_base_url: str | None = None
+    openai_model: str = "gpt-4o"
+    openai_model_light: str = "gpt-4o-mini"
+    openai_default_agent: str = "credential"
 
 
 settings = Settings()

@@ -7,6 +7,7 @@ profile.
 
 import json
 import subprocess
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from pathlib import Path
@@ -79,7 +80,17 @@ class RuffProvider(BaseCredentialProvider):
         rules_to_run = self.rules if self.rules else RUFF_DEFAULT_RULES
         rules = ",".join(rules_to_run)
         result = subprocess.run(
-            ["uv", "run", "ruff", "check", "--output-format", "json", "--select", rules, str(self.target_directory)],
+            [
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                "--output-format",
+                "json",
+                "--select",
+                rules,
+                str(self.target_directory),
+            ],
             capture_output=True,
             text=True,
         )
@@ -117,7 +128,7 @@ class BanditProvider(BaseCredentialProvider):
 
     def generate_audit_records(self) -> Generator[RawFinding]:
         result = subprocess.run(
-            ["uv", "run", "bandit", "-r", "-f", "json", "-l", "-i", str(self.target_directory)],
+            [sys.executable, "-m", "bandit", "-r", "-f", "json", "-l", "-i", str(self.target_directory)],
             capture_output=True,
             text=True,
         )
@@ -158,7 +169,7 @@ class DetectSecretsProvider(BaseCredentialProvider):
 
     def generate_audit_records(self) -> Generator[RawFinding]:
         result = subprocess.run(
-            ["uv", "run", "detect-secrets", "scan", "--all-files", str(self.target_directory)],
+            [sys.executable, "-m", "detect_secrets", "scan", "--all-files", str(self.target_directory)],
             capture_output=True,
             text=True,
         )

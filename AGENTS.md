@@ -2,7 +2,7 @@
 
 ## Overview
 
-**auditkit** — standardized scanner agents for credential and security auditing. Built with pydantic-ai + Typer. Runs static analysis tools (ruff, bandit, detect-secrets), merges overlapping findings into consolidated context blocks, then optionally classifies them via AI (DeepSeek V4 Flash via OpenCode Go API).
+**auditkit** — standardized scanner agents for credential and security auditing. Built with pydantic-ai + Typer. Runs static analysis tools (ruff, bandit, detect-secrets), merges overlapping findings into consolidated context blocks, then optionally classifies them via AI through any OpenAI-compatible API.
 
 ## Commands
 
@@ -16,7 +16,7 @@ uv run python -m auditkit.cli scan <dir> --profile secret-scan
 # Generate markdown report from JSONL
 uv run python -m auditkit.cli report <jsonl_file>
 
-# AI classification (requires .env with OPENCODE_API_KEY)
+# AI classification (requires .env with OPENAI_API_KEY)
 uv run python -m auditkit.cli analyze <jsonl_file>
 
 # Full pipeline: scan → report → classify → validate
@@ -36,12 +36,12 @@ uv run python -m pytest tests/ -v
 ## Setup
 
 ```bash
-cp .env.example .env    # then edit .env with OPENCODE_API_KEY
+cp .env.example .env    # then edit .env with OPENAI_API_KEY
 uv sync
 uv run pre-commit install
 ```
 
-Required env vars: `OPENCODE_API_KEY`, `OPENCODE_BASE_URL` (defaults to `https://opencode.ai/zen/go/v1`), `OPENCODE_MODEL`, `OPENCODE_MODEL_LIGHT`. Loaded via `auditkit/config.py` (pydantic-settings from `.env`).
+Required env vars: `OPENAI_API_KEY`. Optional: `OPENAI_BASE_URL` (defaults to the official OpenAI endpoint), `OPENAI_MODEL` (default `gpt-4o`), `OPENAI_MODEL_LIGHT` (default `gpt-4o-mini`), `OPENAI_DEFAULT_AGENT` (default `credential`). Loaded via `auditkit/config.py` (pydantic-settings from `.env`).
 
 ## Architecture
 
@@ -52,12 +52,21 @@ src/auditkit/
                       # PROFILE_RULES: dict mapping profile name → per-tool rules
   producers.py        # Backward-compat wrappers (run_ruff/run_bandit/run_detect_secrets) delegating to providers
   report_generator.py # build_context_blocks → merge_context_blocks → markdown
-  models.py           # Pydantic models: RawFinding, ContextBlock, ScanEntry, ScanReport, AnalyzedFinding
-  agent_classifier.py # pydantic-ai agent that classifies findings (exposed/false_positive/uncertain)
+  models.py           # Pydantic models: RawFinding, ContextBlock, ScanEntry, ScanReport, AnalyzedFinding, ScanDeps
+  agents/             # Pluggable security-analysis agents
+    base.py           # SecurityAgent ABC: name, description, system_prompt, format_prompt, classify
+    registry.py       # AVAILABLE_AGENTS + get_agent() / list_agents()
+    runner.py         # Shared LLM execution, batching and report merging
+    formatter.py      # Reusable prompt-formatting helpers
+    contexts/         # Specialized agents by security context
+      credential.py   # Credential/secrets classifier (default)
+      injection.py    # SQL/command injection classifier (skeleton)
+      dependency.py   # Vulnerable dependency classifier (skeleton)
+  agent_classifier.py # Backward-compat re-exports delegating to agents/
   cli.py              # Typer app: scan, report, analyze, validate subcommands
   config.py           # pydantic-settings (loads .env)
   validator.py        # Report validation: counts, cross-reference, markdown structure, file paths
-  pipeline.py         # Orchestrator: runs all phases, saves JSONL + JSON + MD, validates at end
+  pipeline.py         # Typer orchestrator: runs all phases, saves JSONL + JSON + MD, validates at end
 tests/
   test_integration.py # Integration tests: scan → report → validate, profile/provider unit tests
   fixtures/           # Sample files with known credential patterns (Python, YAML, JSON, .env)
@@ -71,7 +80,9 @@ tests/
 - **Block merging**: `merge_context_blocks()` consolidates overlapping (±2 line gap) context blocks from different tools. Same-line findings from ruff + bandit + detect-secrets appear in one merged block with multiple `>>>` markers.
 - **Normalized paths**: `_normalize_path()` in providers.py converts all tool output paths to relative paths from cwd. Always apply it to new provider output.
 - **New providers**: subclass `BaseCredentialProvider`, implement `generate_audit_records()`, add to `AVAILABLE_PROVIDERS` and `PROFILE_RULES`.
-- **Batched AI classification**: `analyze` groups findings by file and sends batches of 5 files at a time (`BATCH_SIZE = 5` in agent_classifier.py). Uses `deepseek-v4-flash` model with thinking disabled.
+- **Agent abstraction**: `SecurityAgent` ABC with context-specific `system_prompt`. `analyze`/`pipeline` accept `--agent <name>` to pick a registered agent from `AVAILABLE_AGENTS`. New agents only need to subclass `SecurityAgent`, set `name`/`description`/`system_prompt` and register in `AVAILABLE_AGENTS`.
+- **Batched AI classification**: `analyze` groups findings by file and sends batches per agent (`batch_size`, default 5). Uses the configured `OPENAI_MODEL_LIGHT` through the standard OpenAI connector with thinking disabled.
+- **Unified output model**: All agents produce the same `ScanReport` with `exposed`/`uncertain`/`false_positive` assessments, keeping reports and validation agnostic of the analysis context.
 - **No ruff config in pyproject.toml**: ruff runs with defaults. The scanner invokes ruff directly via subprocess with `--select S105,S106,S107`.
 - **src/ layout**: package lives under `src/auditkit/`. Build system is hatchling.
 

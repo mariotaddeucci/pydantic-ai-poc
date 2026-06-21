@@ -210,7 +210,7 @@ def _rule_label(rule_id: str) -> str:
 def append_analysis_to_markdown(md_path: str, report: ScanReport) -> None:
     """Append the agent's classification to the markdown report."""
     lines = [
-        "## Análise do Agente (DeepSeek V4 Flash)",
+        "## Análise do Agente",
         "",
         "| Classificação | Quantidade |",
         "|---------------|------------|",

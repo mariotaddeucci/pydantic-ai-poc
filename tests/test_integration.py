@@ -36,9 +36,40 @@ def _is_api_key_set() -> bool:
     try:
         from auditkit.config import settings
 
-        return bool(settings.opencode_api_key)
+        return bool(settings.openai_api_key)
     except Exception:
         return False
+
+
+# ── Agent registry tests ─────────────────────────────────────────────
+
+
+def test_agent_registry_contains_default_agents():
+    from auditkit.agents import AVAILABLE_AGENTS, list_agents
+
+    agents = list_agents()
+    assert "credential" in agents
+    assert "injection" in agents
+    assert "dependency" in agents
+    assert len(AVAILABLE_AGENTS) == 3
+
+
+def test_get_agent_returns_expected_classes():
+    from auditkit.agents import get_agent
+    from auditkit.agents.contexts.credential import CredentialAgent
+    from auditkit.agents.contexts.dependency import DependencyAgent
+    from auditkit.agents.contexts.injection import InjectionAgent
+
+    assert get_agent("credential") is CredentialAgent
+    assert get_agent("injection") is InjectionAgent
+    assert get_agent("dependency") is DependencyAgent
+
+
+def test_get_agent_raises_for_unknown_agent():
+    from auditkit.agents import get_agent
+
+    with pytest.raises(ValueError, match="Unknown agent"):
+        get_agent("nonexistent")
 
 
 def _clean_artifacts(target_dir: Path) -> None:
@@ -148,7 +179,7 @@ def test_validate_without_analyze():
     assert "No analyze JSON" in result.stderr, f"Unexpected: {result.stderr[:200]}"
 
 
-@pytest.mark.skipif(not _is_api_key_set(), reason="OPENCODE_API_KEY not set")
+@pytest.mark.skipif(not _is_api_key_set(), reason="OPENAI_API_KEY not set")
 def test_full_pipeline_with_ai():
     """Run full pipeline including AI classification (requires API key)."""
     import asyncio
@@ -156,6 +187,22 @@ def test_full_pipeline_with_ai():
     from auditkit.pipeline import run as pipeline_run
 
     report_path = asyncio.run(pipeline_run(str(EXAMPLES_DIR)))
+    if report_path:
+        assert Path(report_path).exists(), f"Report not found: {report_path}"
+        content = Path(report_path).read_text(encoding="utf-8")
+        assert "Análise do Agente" in content
+    else:
+        pytest.skip("No findings — nothing to validate")
+
+
+@pytest.mark.skipif(not _is_api_key_set(), reason="OPENAI_API_KEY not set")
+def test_full_pipeline_with_injection_agent():
+    """Run full pipeline using the injection agent skeleton (requires API key)."""
+    import asyncio
+
+    from auditkit.pipeline import run as pipeline_run
+
+    report_path = asyncio.run(pipeline_run(str(EXAMPLES_DIR), agent_name="injection"))
     if report_path:
         assert Path(report_path).exists(), f"Report not found: {report_path}"
         content = Path(report_path).read_text(encoding="utf-8")

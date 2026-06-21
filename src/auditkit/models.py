@@ -1,9 +1,20 @@
 """Shared Pydantic models for the credential scanner pipeline."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+@dataclass
+class ScanDeps:
+    """Dependencies passed to pydantic-ai agents during classification."""
+
+    directory: str
+    blocks: list[ContextBlock]
 
 
 class RawFinding(BaseModel):
