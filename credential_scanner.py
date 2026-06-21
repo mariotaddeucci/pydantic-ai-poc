@@ -1,11 +1,8 @@
-"""Credential scanner — backwards-compatible entry point.
+"""Credential scanner — CLI entry point.
 
-Delegates to credential_scanner.pipeline.
+Delegates to credential_scanner.cli typer app.
 """
-
-import asyncio
-
-from credential_scanner.pipeline import main
+from credential_scanner.cli import app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app()

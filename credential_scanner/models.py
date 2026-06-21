@@ -48,3 +48,9 @@ class ScanReport(BaseModel):
     exposed: int = 0
     uncertain: int = 0
     findings: list[AnalyzedFinding] = Field(default_factory=list)
+
+
+class ScanEntry(BaseModel):
+    """Single finding with pre-built context — one JSONL line."""
+    finding: RawFinding
+    snippet: str
