@@ -1,0 +1,17 @@
+{
+  "api": {
+    "base_url": "https://api.example.com/v2",
+    "api_key": "json-api-key-8a7b6c5d4e3f2a1b0c9d8e7f",
+    "webhook_secret": "whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  },
+  "auth": {
+    "client_id": "app-12345",
+    "client_secret": "json-s3cr3t-cl13nt-k3y-2024",
+    "token_endpoint": "https://auth.example.com/oauth/token"
+  },
+  "storage": {
+    "s3_bucket": "prod-assets",
+    "aws_access_key": "AKIAJSONEXAMPLEKEY123",
+    "aws_secret_key": "jsonAwsSecretKey/wJalrXUtnFEMI/K7MDENG"
+  }
+}

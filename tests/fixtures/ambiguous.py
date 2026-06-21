@@ -1,6 +1,7 @@
 """
 Example 3: Multi-language / ambiguous — test cross-file and uncertain patterns.
 """
+
 import hashlib
 
 # Ambiguous: could be dev key or prod

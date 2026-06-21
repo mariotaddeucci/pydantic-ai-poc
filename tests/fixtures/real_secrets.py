@@ -1,6 +1,7 @@
 """
 Example 1: Hardcoded API keys and tokens — should flag as EXPOSED.
 """
+
 import os
 
 # Real-looking OpenAI key pattern
@@ -18,6 +19,10 @@ class Config:
     DATABASE_URL = "postgresql://admin:SuperSecret123!@localhost:5432/prod"
 
 
-def connect():
-    # Hardcoded password as function argument default
-    return os.popen("mysql -u root -p'h4rdc0d3d'")
+# Hardcoded password variable — triggers bandit B105
+password = "Pr0dS3cr3t!2024"
+
+
+def connect(host="db.internal", passwd="r00t_p@ss"):
+    # Hardcoded password as function arg default — triggers bandit B106/B107
+    return os.popen(f"mysql -u root -h {host} -p'{passwd}'")

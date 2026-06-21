@@ -11,8 +11,8 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 
-from config import settings
-from credential_scanner.models import ContextBlock, ScanReport
+from auditkit.config import settings
+from auditkit.models import ContextBlock, ScanReport
 
 BATCH_SIZE = 5
 
@@ -59,14 +59,14 @@ def _format_prompt(blocks: list[ContextBlock], directory: str) -> str:
             f"**File:** `{b.file_path}` | **Lines:** {b.start_line}-{b.end_line} | "
             f"**Flagged:** {flagged}\n"
             f"**Tools:** {', '.join(sorted(tools))} | **Rules:** {', '.join(sorted(rules))}\n\n"
-            f"**Findings:**\n" +
-            "\n".join(f"- [{f.rule_id}] line {f.line_number}: {f.description}" for f in b.findings) +
-            f"\n\n```\n{b.snippet}\n```\n"
+            f"**Findings:**\n"
+            + "\n".join(f"- [{f.rule_id}] line {f.line_number}: {f.description}" for f in b.findings)
+            + f"\n\n```\n{b.snippet}\n```\n"
         )
     return (
         f"Analyse the following security scan results from directory `{directory}`.\n\n"
-        + "\n".join(blocks_text) +
-        "\n\nFor each finding, classify it as false_positive, exposed, or uncertain. "
+        + "\n".join(blocks_text)
+        + "\n\nFor each finding, classify it as false_positive, exposed, or uncertain. "
         "Include your reasoning for each classification."
     )
 
@@ -89,9 +89,7 @@ async def classify_batch(
         prompt,
         deps=deps,
         model=model,
-        model_settings=OpenAIChatModelSettings(
-            extra_body={"thinking": {"type": "disabled"}}
-        ),
+        model_settings=OpenAIChatModelSettings(extra_body={"thinking": {"type": "disabled"}}),
         usage_limits=UsageLimits(request_limit=200),
     )
     return result.output

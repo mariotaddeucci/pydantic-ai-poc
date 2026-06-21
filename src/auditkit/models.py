@@ -1,6 +1,6 @@
 """Shared Pydantic models for the credential scanner pipeline."""
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 class RawFinding(BaseModel):
     """Generic finding produced by any scanning tool."""
+
     file_path: str
     line_number: int
     rule_id: str
@@ -18,6 +19,7 @@ class RawFinding(BaseModel):
 
 class ContextBlock(BaseModel):
     """Pre-assembled context for one or more merged findings."""
+
     file_path: str
     start_line: int
     end_line: int
@@ -26,7 +28,7 @@ class ContextBlock(BaseModel):
     snippet: str
 
 
-class Assessment(str, Enum):
+class Assessment(StrEnum):
     FALSE_POSITIVE = "false_positive"
     EXPOSED = "exposed"
     UNCERTAIN = "uncertain"
@@ -52,5 +54,6 @@ class ScanReport(BaseModel):
 
 class ScanEntry(BaseModel):
     """Single finding with pre-built context — one JSONL line."""
+
     finding: RawFinding
     snippet: str

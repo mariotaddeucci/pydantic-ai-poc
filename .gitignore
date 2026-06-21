@@ -29,8 +29,13 @@ Thumbs.db
 # UV
 uv.lock
 
+# Testing
+.pytest_cache/
+
 # detect-secrets baseline
 .secrets.baseline
 
 # Generated scan reports
 **/credential_scan_report.md
+**/scan_results.jsonl
+**/analyze_results.json

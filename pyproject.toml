@@ -1,7 +1,7 @@
 [project]
-name = "pydantic-ai-poc"
+name = "auditkit"
 version = "0.1.0"
-description = "Add your description here"
+description = "Standardized scanner agents for credential and security auditing"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -15,8 +15,87 @@ dev = [
     "bandit>=1.9.4",
     "detect-secrets>=1.5.0",
     "pre-commit>=4.6.0",
+    "pyrefly>=1.1.1",
+    "pytest>=9.1.1",
     "ruff>=0.15.18",
 ]
 
 [project.scripts]
-credential-scanner = "credential_scanner.cli:app"
+auditkit = "auditkit.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/auditkit"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+select = [
+    "F",     # Pyflakes — basic errors
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "I",     # isort — import ordering
+    "N",     # pep8-naming
+    "UP",    # pyupgrade — modern Python syntax
+    "S",     # flake8-bandit — security
+    "B",     # flake8-bugbear
+    "SIM",   # flake8-simplify
+    "C4",    # flake8-comprehensions
+    "RUF",   # ruff-specific rules
+    "A",     # flake8-builtins
+    "PL",    # pylint (errors + warnings + refactoring)
+    "RSE",   # flake8-raise
+    "RET",   # flake8-return
+    "PIE",   # flake8-pie
+    "PERF",  # perflint
+    "T20",   # print statement detection
+    "TCH",   # flake8-type-checking
+    "SLOT",  # flake8-slots
+    "YTT",   # flake8-2020
+    "ASYNC", # flake8-async
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["auditkit"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/auditkit/__init__.py" = ["F401"]
+"src/auditkit/pipeline.py" = ["T201", "PLR0915", "ASYNC240", "PLC0415"]
+"src/auditkit/providers.py" = ["S603", "S607", "S112", "PLW1510", "TC003"]
+"src/auditkit/producers.py" = ["TC001"]
+"src/auditkit/validator.py" = ["TC001"]
+"src/auditkit/report_generator.py" = ["PLC0415"]
+"src/auditkit/cli.py" = ["PLR0912", "SIM115"]
+"tests/test_integration.py" = ["S", "T20", "PLR2004", "PLR0913", "ARG", "PLW1510", "PLC0415", "TC003"]
+"tests/fixtures/**/*.py" = ["T20", "F541", "PLC0415"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.pyrefly]
+check-unannotated-defs = true
+infer-return-types = "checked"
+search-path = ["src"]
+ignore-missing-imports = ["config"]
+project-excludes = [
+    "**/.*/**",
+    "**/__pycache__",
+    "**/venv/**",
+    "**/.venv/**",
+    "**/node_modules",
+    "**/dist",
+    "**/build",
+    "**/*.egg-info/**",
+]

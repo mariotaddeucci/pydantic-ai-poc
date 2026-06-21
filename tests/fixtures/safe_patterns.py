@@ -1,9 +1,10 @@
 """
 Example 2: Safe patterns — should be FALSE POSITIVE or not flagged at all.
 """
-import os
-from config import settings
 
+import os
+
+from config import settings
 
 # Environment variable reference — safe
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/test")
