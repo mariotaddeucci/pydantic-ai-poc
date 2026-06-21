@@ -1,8 +1,9 @@
-"""CLI for credential scanner — two-step pipeline with JSONL interchange.
+"""CLI for credential scanner — three-step pipeline with JSONL interchange.
 
 Commands:
   scan     Run producers, build context, output one JSONL line per finding.
-  analyze  Read JSONL, run the AI agent classifier in batches, output report.
+  report   Read JSONL, generate a markdown report with findings and code context.
+  analyze  Read JSONL, run the AI agent classifier in batches, output JSON report.
 """
 
 import asyncio
@@ -21,15 +22,20 @@ from config import settings
 from credential_scanner.agent_classifier import BATCH_SIZE, classify_batch, merge_reports
 from credential_scanner.models import RawFinding, ScanEntry, ScanReport
 from credential_scanner.producers import TOOL_RUNNERS
-from credential_scanner.report_generator import build_context_blocks
+from credential_scanner.report_generator import build_context_blocks, build_markdown_report
 
 app = typer.Typer(no_args_is_help=True)
+
+
+def _err(msg: str = "") -> None:
+    """Print to stderr."""
+    typer.echo(msg, err=True)
 
 
 @app.command()
 def scan(
     directory: str = typer.Argument(".", help="Directory to scan for credentials"),
-    output: str | None = typer.Option(None, "--output", "-o", help="JSONL output file (default: <dir>/scan_results.jsonl)"),
+    output: str | None = typer.Option(None, "--output", "-o", help="JSONL output file (default: stdout)"),
 ):
     """Scan a directory for hardcoded credentials.
 
@@ -37,21 +43,21 @@ def scan(
     context blocks (±3 non-blank lines around each finding), and
     outputs one JSONL line per finding.
     """
-    print(f"Scanning: {directory}")
+    _err(f"Scanning: {directory}")
 
     all_findings: list[RawFinding] = []
     for tool_name, runner in TOOL_RUNNERS:
-        print(f"  Running {tool_name}...")
+        _err(f"  Running {tool_name}...")
         try:
             findings = runner(directory)
-            print(f"    {len(findings)} finding(s)")
+            _err(f"    {len(findings)} finding(s)")
             all_findings.extend(findings)
         except Exception as e:
-            print(f"    Skipped: {e}")
+            _err(f"    Skipped: {e}")
 
-    print(f"\nTotal raw findings: {len(all_findings)}")
+    _err(f"Total raw findings: {len(all_findings)}")
     if not all_findings:
-        print("No security issues found.")
+        _err("No security issues found.")
         return
 
     # Build context blocks (one per file group, merged)
@@ -63,54 +69,99 @@ def scan(
         for f in b.findings:
             entries.append(ScanEntry(finding=f, snippet=b.snippet))
 
-    out_path = Path(output) if output else Path(directory) / "scan_results.jsonl"
-    with open(out_path, "w", encoding="utf-8") as f:
-        for entry in entries:
-            f.write(entry.model_dump_json() + "\n")
+    # Write JSONL — to file or stdout
+    lines = "\n".join(e.model_dump_json() for e in entries) + "\n"
+    if output:
+        Path(output).write_text(lines, encoding="utf-8")
+        _err(f"JSONL saved: {output} ({len(entries)} entries)")
+    else:
+        sys.stdout.write(lines)
+        _err(f"JSONL written to stdout ({len(entries)} entries)")
 
-    print(f"\nJSONL saved: {out_path} ({len(entries)} entries)")
 
-
-@app.command()
-def analyze(
-    jsonl_file: str = typer.Argument(..., help="JSONL file from the scan command"),
-    directory: str | None = typer.Option(None, "--directory", "-d", help="Override report directory label"),
-):
-    """Analyze JSONL scan results with the AI agent.
-
-    Reads findings from a JSONL file, groups by file, runs the
-    DeepSeek V4 Flash agent in batches of 5 files, and prints
-    the final ScanReport as JSON.
-    """
-    if not settings.opencode_api_key:
-        print("Erro: OPENCODE_API_KEY nao definida.")
-        print("Copie .env.example para .env e preencha sua chave do OpenCode Go.")
-        raise typer.Exit(1)
-
-    p = Path(jsonl_file)
-    if not p.exists():
-        print(f"File not found: {jsonl_file}")
-        raise typer.Exit(1)
-
-    # Read JSONL
+def _read_jsonl(jsonl_file: str | None) -> list[ScanEntry]:
+    """Read ScanEntry items from a JSONL file or stdin."""
     entries: list[ScanEntry] = []
-    with open(p, encoding="utf-8") as f:
-        for line in f:
+    if jsonl_file:
+        p = Path(jsonl_file)
+        if not p.exists():
+            _err(f"File not found: {jsonl_file}")
+            raise typer.Exit(1)
+        source = open(p, encoding="utf-8")
+    else:
+        source = sys.stdin
+    with source:
+        for line in source:
             line = line.strip()
             if not line:
                 continue
             entries.append(ScanEntry.model_validate_json(line))
+    return entries
 
+
+@app.command()
+def report(
+    jsonl_file: str | None = typer.Argument(None, help="JSONL file from the scan command (or stdin)"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Markdown output file (default: <jsonl_dir>/credential_scan_report.md)"),
+    directory: str | None = typer.Option(None, "--directory", "-d", help="Directory label in the report header"),
+):
+    """Generate a markdown report from JSONL scan results.
+
+    Reads findings from a JSONL file (or stdin), rebuilds context blocks,
+    and exports a markdown report with code snippets for each finding.
+    No AI agent is invoked — this is the first-level human review report.
+    """
+    entries = _read_jsonl(jsonl_file)
     all_findings = [e.finding for e in entries]
-    dir_label = directory or str(p.parent)
+    dir_label = directory or (str(Path(jsonl_file).parent) if jsonl_file else ".")
 
-    print(f"Loaded {len(all_findings)} findings from {jsonl_file}")
+    if not all_findings:
+        _err("No findings to report.")
+        return
+
+    # Rebuild context blocks from findings
+    blocks = build_context_blocks(all_findings)
+    tools = sorted({f.tool_name for f in all_findings})
+    md_content = build_markdown_report(blocks, dir_label, tools)
+
+    out_path = Path(output) if output else Path(dir_label) / "credential_scan_report.md"
+    out_path.write_text(md_content, encoding="utf-8")
+    _err(f"Report saved: {out_path}")
+    _err(f"  Files flagged: {len({b.file_path for b in blocks})}")
+    _err(f"  Context blocks: {len(blocks)}")
+    _err(f"  Findings: {len(all_findings)}")
+
+
+@app.command()
+def analyze(
+    jsonl_file: str | None = typer.Argument(None, help="JSONL file from the scan command (or stdin)"),
+    directory: str | None = typer.Option(None, "--directory", "-d", help="Override report directory label"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress status output, print only JSON"),
+):
+    """Analyze JSONL scan results with the AI agent.
+
+    Reads findings from a JSONL file (or stdin), groups by file, runs the
+    DeepSeek V4 Flash agent in batches of 5 files, and prints the final
+    ScanReport as JSON to stdout.
+    """
+    if not settings.opencode_api_key:
+        _err("Erro: OPENCODE_API_KEY nao definida.")
+        _err("Copie .env.example para .env e preencha sua chave do OpenCode Go.")
+        raise typer.Exit(1)
+
+    entries = _read_jsonl(jsonl_file)
+    all_findings = [e.finding for e in entries]
+    dir_label = directory or (str(Path(jsonl_file).parent) if jsonl_file else ".")
+
+    if not quiet:
+        _err(f"Loaded {len(all_findings)} findings")
 
     # Group by file and split into batches
     files_flagged = list(dict.fromkeys(f.file_path for f in all_findings))
     batches = [files_flagged[i : i + BATCH_SIZE] for i in range(0, len(files_flagged), BATCH_SIZE)]
-    print(f"Files flagged: {len(files_flagged)}")
-    print(f"Batches: {len(batches)} ({BATCH_SIZE} files each)")
+    if not quiet:
+        _err(f"Files flagged: {len(files_flagged)}")
+        _err(f"Batches: {len(batches)} ({BATCH_SIZE} files each)")
 
     async def _run():
         reports: list[ScanReport] = []
@@ -119,21 +170,21 @@ def analyze(
             batch_findings = [f for f in all_findings if f.file_path in batch_set]
             batch_blocks = build_context_blocks(batch_findings)
 
-            print(f"\n  Batch {i}/{len(batches)} — {len(batch_files)} file(s)")
-            for bf in batch_files:
-                print(f"    {bf}")
+            if not quiet:
+                _err(f"  Batch {i}/{len(batches)} — {len(batch_files)} file(s)")
+                for bf in batch_files:
+                    _err(f"    {bf}")
 
             report = await classify_batch(batch_blocks, dir_label)
             reports.append(report)
-            print(f"    → {report.total_findings} analysed, "
-                  f"exposed={report.exposed}, uncertain={report.uncertain}, "
-                  f"false_positives={report.false_positives}")
+            if not quiet:
+                _err(f"    → {report.total_findings} analysed, "
+                      f"exposed={report.exposed}, uncertain={report.uncertain}, "
+                      f"false_positives={report.false_positives}")
 
         final = merge_reports(reports, dir_label)
-
-        # Output as JSON
-        print(f"\n{'=' * 60}")
-        print(json.dumps(final.model_dump(), indent=2, ensure_ascii=False))
+        # Output JSON to stdout
+        sys.stdout.write(json.dumps(final.model_dump(), indent=2, ensure_ascii=False) + "\n")
 
     asyncio.run(_run())
 
