@@ -1,6 +1,7 @@
 import json
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from itertools import groupby
 from pathlib import Path
@@ -14,7 +15,7 @@ from pydantic_ai.usage import UsageLimits
 
 from config import settings
 
-CONTEXT_LINES = 5
+CONTEXT_LINES = 3
 
 RUFF_CREDENTIAL_RULES = [
     "S105",  # hardcoded-password-string
@@ -288,6 +289,100 @@ def _format_prompt_from_blocks(blocks: list[ContextBlock], directory: str) -> st
     )
 
 
+def _build_markdown_report(
+    blocks: list[ContextBlock],
+    directory: str,
+    tools_used: list[str],
+) -> str:
+    """Generate a self-contained markdown report for first-level human review."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    total = sum(len(b.findings) for b in blocks)
+    files_flagged = len({b.file_path for b in blocks})
+
+    lines = [
+        f"# Credential Scan Report",
+        f"",
+        f"**Directory:** `{directory}`  ",
+        f"**Generated:** {now}  ",
+        f"**Tools:** {', '.join(tools_used)}  ",
+        f"**Files flagged:** {files_flagged}  ",
+        f"**Findings:** {total}  ",
+        f"",
+        f"---",
+        f"",
+    ]
+
+    for i, b in enumerate(blocks, 1):
+        rules = {f.rule_id for f in b.findings}
+        flagged = ", ".join(str(ln) for ln in b.finding_lines)
+        lines.extend([
+            f"### {i}. `{b.file_path}`",
+            f"",
+            f"| Campo | Valor |",
+            f"|-------|-------|",
+            f"| **Linhas do bloco** | {b.start_line}–{b.end_line} |",
+            f"| **Linhas flagadas** | {flagged} |",
+            f"| **Regras** | {', '.join(sorted(rules))} |",
+            f"",
+            f"**Ocorrências:**",
+            f"",
+        ])
+        for f in b.findings:
+            lines.append(f"- `[{f.rule_id}]` linha **{f.line_number}** — {f.description}")
+        lines.extend([
+            f"",
+            f"```",
+            b.snippet,
+            f"```",
+            f"",
+            f"---",
+            f"",
+        ])
+
+    return "\n".join(lines)
+
+
+def _append_analysis_to_markdown(
+    md_path: str,
+    report: ScanReport,
+) -> None:
+    """Append the agent's classification to the markdown report."""
+    lines = [
+        f"## Análise do Agente (DeepSeek V4 Flash)",
+        f"",
+        f"| Classificação | Quantidade |",
+        f"|---------------|------------|",
+        f"| 🔴 Exposto     | {report.exposed} |",
+        f"| 🟡 Incerto     | {report.uncertain} |",
+        f"| 🟢 Falso positivo | {report.false_positives} |",
+        f"| **Total**      | **{report.total_findings}** |",
+        f"",
+        f"---",
+        f"",
+    ]
+
+    for f in report.findings:
+        emoji = {"exposed": "🔴", "uncertain": "🟡", "false_positive": "🟢"}.get(
+            f.assessment, "⚪"
+        )
+        lines.extend([
+            f"### {emoji} `{f.file_path}`:{f.line_number} `[{f.rule_id}]`",
+            f"",
+            f"**Classificação:** {f.assessment.replace('_', ' ').title()}",
+            f"",
+            f"**Justificativa:** {f.reasoning}",
+            f"",
+            f"**Trecho:**",
+            f"```",
+            f.context,
+            f"```",
+            f"",
+        ])
+
+    with open(md_path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
 async def _analyse_batch(
     batch_files: list[str],
     all_findings: list[RawFinding],
@@ -341,7 +436,17 @@ async def main():
         print("No security issues found.")
         return
 
-    # Phase 2: group by file and split into batches
+    # Phase 2: pre-context — build blocks, generate markdown report
+    tools_used = [t[0] for t in TOOL_RUNNERS]
+    global_blocks = build_context_blocks(all_findings)
+    md_path = Path(directory) / "credential_scan_report.md"
+    md_content = _build_markdown_report(global_blocks, directory, tools_used)
+    md_path.write_text(md_content, encoding="utf-8")
+    print(f"\nPre-context report saved: {md_path}")
+    print(f"  Files flagged: {len({b.file_path for b in global_blocks})}")
+    print(f"  Context blocks: {len(global_blocks)}")
+
+    # Phase 3: group by file and split into batches for agent analysis
     files_flagged = list(dict.fromkeys(f.file_path for f in all_findings))
     batches = [files_flagged[i:i + BATCH_SIZE] for i in range(0, len(files_flagged), BATCH_SIZE)]
 
@@ -351,10 +456,8 @@ async def main():
     )
     model = OpenAIChatModel(settings.opencode_model_light, provider=provider)
 
-    print(f"\nFiles flagged: {len(files_flagged)}")
-    print(f"Batches: {len(batches)} ({BATCH_SIZE} files each)")
+    print(f"\nBatches: {len(batches)} ({BATCH_SIZE} files each)")
 
-    # Phase 3: process each batch through the agent
     reports: list[ScanReport] = []
     for i, batch in enumerate(batches, 1):
         print(f"\n  Batch {i}/{len(batches)} — {len(batch)} file(s)")
@@ -366,8 +469,11 @@ async def main():
               f"exposed={report.exposed}, uncertain={report.uncertain}, "
               f"false_positives={report.false_positives}")
 
-    # Phase 4: merge and print
+    # Phase 4: merge and append agent analysis to markdown
     final = _merge_reports(reports, directory)
+    _append_analysis_to_markdown(str(md_path), final)
+    print(f"\nAgent analysis appended to: {md_path}")
+
     print(f"\n{'=' * 60}")
     print(f"FINAL SCAN REPORT — {final.directory}")
     print(f"{'=' * 60}")
@@ -375,11 +481,7 @@ async def main():
     print(f"  Exposed:         {final.exposed}")
     print(f"  Uncertain:       {final.uncertain}")
     print(f"  False positives: {final.false_positives}")
-    print(f"\n--- Detailed findings ---")
-    for f in final.findings:
-        print(f"\n[{f.assessment.upper()}] {f.file_path}:{f.line_number} [{f.rule_id}]")
-        print(f"  Reasoning: {f.reasoning}")
-        print(f"  Context:\n{f.context}")
+    print(f"\nFull report: {md_path}")
 
 
 if __name__ == "__main__":

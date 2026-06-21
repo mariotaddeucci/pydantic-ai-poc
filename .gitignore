@@ -31,3 +31,6 @@ uv.lock
 
 # detect-secrets baseline
 .secrets.baseline
+
+# Generated scan reports
+*credential_scan_report.md
