@@ -13,6 +13,3 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o"
     openai_model_light: str = "gpt-4o-mini"
     openai_default_agent: str = "credential"
-
-
-settings = Settings()

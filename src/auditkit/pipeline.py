@@ -6,6 +6,11 @@ Phases:
   3. agent        → classify ContextBlocks in batches → ScanReport[]
   4. merge + save → append agent analysis to markdown + validate
 
+All I/O and subprocess calls are async under the hood.  The `run()` async
+function can be called from tests with asyncio.run().  The Typer `main()`
+command wraps it with asyncio.run().  Settings are created freshly per
+invocation (no global singleton).
+
 Usage:
   uv run python -m auditkit.pipeline <directory>
   uv run python -m auditkit.pipeline <directory> --agent injection
@@ -20,9 +25,9 @@ import typer
 
 from auditkit.agents import get_agent, merge_reports
 from auditkit.agents.runner import classify_batch
-from auditkit.config import settings
+from auditkit.config import Settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
-from auditkit.providers import AVAILABLE_PROVIDERS, PROFILE_RULES
+from auditkit.providers import AGENT_PROFILES, create_providers
 from auditkit.report_generator import (
     append_analysis_to_markdown,
     build_context_blocks,
@@ -39,8 +44,9 @@ from auditkit.validator import (
 app = typer.Typer(no_args_is_help=True)
 
 
-def _filter_provider_names(select: str | None, exclude: str | None) -> list[str]:
-    """Apply --select / --exclude filters to provider names."""
+def _filter_provider_names(select: str | None, exclude: str | None, agent: str) -> list[str]:
+    """Apply --select / --exclude filters to provider names for a given agent."""
+    available = set(AGENT_PROFILES.get(agent, {}))
     selected = {s.strip() for s in select.split(",")} if select else None
     excluded = {s.strip() for s in exclude.split(",")} if exclude else set()
 
@@ -49,27 +55,27 @@ def _filter_provider_names(select: str | None, exclude: str | None) -> list[str]
         raise typer.Exit(2)
 
     if selected is not None:
-        invalid = selected - set(AVAILABLE_PROVIDERS)
+        invalid = selected - available
         if invalid:
             print(f"Unknown tool(s): {', '.join(sorted(invalid))}", file=sys.stderr)
             raise typer.Exit(2)
-        return [n for n in AVAILABLE_PROVIDERS if n in selected]
-    return [n for n in AVAILABLE_PROVIDERS if n not in excluded]
+        return [n for n in available if n in selected]
+    return [n for n in available if n not in excluded]
 
 
 async def run(
     directory: str,
+    settings: Settings,
     agent_name: str = "credential",
-    profile: str = "secret-scan",
     select: str | None = None,
     exclude: str | None = None,
 ) -> str | None:
     """Run the full pipeline. Returns path to markdown report or None if clean."""
     dir_path = Path(directory).resolve()
 
-    if profile not in PROFILE_RULES:
+    if agent_name not in AGENT_PROFILES:
         print(
-            f"Unknown profile: {profile}. Available: {', '.join(sorted(PROFILE_RULES))}",
+            f"Unknown agent: {agent_name}. Available: {', '.join(sorted(AGENT_PROFILES))}",
             file=sys.stderr,
         )
         raise typer.Exit(2)
@@ -81,21 +87,18 @@ async def run(
         raise typer.Exit(2) from e
 
     # ── Phase 1: producers (scan) ──────────────────────────────────
-    names = _filter_provider_names(select, exclude)
+    names = _filter_provider_names(select, exclude, agent_name)
     if not names:
         print("No tools selected — nothing to run.", file=sys.stderr)
         return None
 
-    profile_rules = PROFILE_RULES[profile]
     all_findings: list[RawFinding] = []
     for name in names:
         print(f"  Running {name}...")
         try:
-            provider_cls = AVAILABLE_PROVIDERS[name]
-            rules = profile_rules.get(name, [])
-            provider = provider_cls(directory, rules=rules)
+            provider = create_providers(directory, agent=agent_name, select=[name])[0]
             count = 0
-            for finding in provider.generate_audit_records():
+            async for finding in provider.generate_audit_records():
                 all_findings.append(finding)
                 count += 1
             print(f"    {count} finding(s)")
@@ -109,20 +112,21 @@ async def run(
 
     # ── Phase 1b: persist JSONL for validation ────────────────────
     tools_used = sorted({f.tool_name for f in all_findings})
-    blocks = build_context_blocks(all_findings)
-    merged_blocks = merge_context_blocks(blocks)
+    blocks = await build_context_blocks(all_findings)
+    merged_blocks = await merge_context_blocks(blocks)
     entries = [ScanEntry(finding=f, snippet=b.snippet) for b in merged_blocks for f in b.findings]
     jsonl_path = dir_path / "scan_results.jsonl"
-    jsonl_path.write_text(
+    await asyncio.to_thread(
+        jsonl_path.write_text,
         "\n".join(e.model_dump_json() for e in entries) + "\n",
         encoding="utf-8",
     )
     print(f"JSONL saved: {jsonl_path} ({len(entries)} entries)")
 
     # ── Phase 2: report generator ─────────────────────────────────
-    md_path = dir_path / "credential_scan_report.md"
-    md_content = build_markdown_report(merged_blocks, str(directory), tools_used)
-    md_path.write_text(md_content, encoding="utf-8")
+    md_path = dir_path / f"{agent_name}_scan_report.md"
+    md_content = build_markdown_report(merged_blocks, str(directory), tools_used, agent_name=agent_name)
+    await asyncio.to_thread(md_path.write_text, md_content, encoding="utf-8")
     print(f"\nPre-context report saved: {md_path}")
     print(f"  Files flagged: {len({b.file_path for b in merged_blocks})}")
     print(f"  Context blocks (merged): {len(merged_blocks)}")
@@ -139,14 +143,14 @@ async def run(
     for i, batch_files in enumerate(batches, 1):
         batch_set = set(batch_files)
         batch_findings = [f for f in all_findings if f.file_path in batch_set]
-        batch_blocks = build_context_blocks(batch_findings)
-        batch_blocks = merge_context_blocks(batch_blocks)
+        batch_blocks = await build_context_blocks(batch_findings)
+        batch_blocks = await merge_context_blocks(batch_blocks)
 
         print(f"\n  Batch {i}/{len(batches)} — {len(batch_files)} file(s)")
         for f in batch_files:
             print(f"    {f}")
 
-        report = await classify_batch(agent, batch_blocks, str(directory))
+        report = await classify_batch(agent, batch_blocks, str(directory), settings)
         reports.append(report)
         print(
             f"    → {report.total_findings} analysed, "
@@ -156,12 +160,12 @@ async def run(
 
     # ── Phase 4: merge + save ─────────────────────────────────────
     final = merge_reports(reports, str(directory))
-    append_analysis_to_markdown(str(md_path), final)
+    await append_analysis_to_markdown(str(md_path), final)
     print(f"\nAgent analysis appended to: {md_path}")
 
-    # Persist analyze JSON for validation
     analyze_path = dir_path / "analyze_results.json"
-    analyze_path.write_text(
+    await asyncio.to_thread(
+        analyze_path.write_text,
         json.dumps(final.model_dump(), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -180,12 +184,12 @@ async def run(
     print(f"\n{'─' * 60}")
     print("VALIDATION")
     print(f"{'─' * 60}")
-    _run_validation(entries, final, md_path)
+    await _run_validation(entries, final, md_path)
 
     return str(md_path)
 
 
-def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path: Path) -> None:
+async def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path: Path) -> None:
     """Inline validation — exits with code 1 if any checks fail."""
     all_errors: list[str] = []
 
@@ -202,8 +206,8 @@ def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path: Path)
     all_ok = True
     all_ok &= check("Internal counts", validate_counts(report))
     all_ok &= check("Cross-reference (scan ↔ analyze)", validate_cross_reference(entries, report))
-    all_ok &= check("Markdown structure", validate_markdown(md_path, report))
-    all_ok &= check("File paths existence", validate_paths(entries))
+    all_ok &= check("Markdown structure", await validate_markdown(md_path, report))
+    all_ok &= check("File paths existence", await validate_paths(entries))
 
     if all_ok:
         print("  All validations passed.")
@@ -214,24 +218,26 @@ def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path: Path)
 @app.command()
 def main(
     directory: str = typer.Argument(".", help="Directory to scan"),
-    agent: str = typer.Option(
-        settings.openai_default_agent,
+    agent: str | None = typer.Option(
+        None,
         "--agent",
         "-a",
-        help="Agent context to use for analysis",
+        help=f"Agent context. Available: {', '.join(sorted(AGENT_PROFILES))}",
     ),
-    profile: str = typer.Option("secret-scan", "--profile", "-p", help="Scan profile with pre-configured rules"),
     select: str | None = typer.Option(None, "--select", help="Comma-separated tool names to run (default: all)"),
     exclude: str | None = typer.Option(None, "--exclude", help="Comma-separated tool names to skip (default: none)"),
 ) -> None:
     """Run the full security scan pipeline."""
+    settings = Settings()
+
     if not settings.openai_api_key:
         print("Erro: OPENAI_API_KEY nao definida.", file=sys.stderr)
         print("Copie .env.example para .env e preencha sua chave da OpenAI.", file=sys.stderr)
         raise typer.Exit(1)
 
+    agent_name = agent or settings.openai_default_agent
     print(f"Scanning directory: {directory}")
-    asyncio.run(run(directory, agent_name=agent, profile=profile, select=select, exclude=exclude))
+    asyncio.run(run(directory, settings, agent_name=agent_name, select=select, exclude=exclude))
 
 
 if __name__ == "__main__":

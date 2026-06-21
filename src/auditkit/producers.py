@@ -1,34 +1,33 @@
 """Tool adapters that produce RawFinding lists — thin wrappers delegating to providers.
 
-Backward-compatible wrapper functions run_ruff / run_bandit / run_detect_secrets
-delegate to the provider classes in auditkit.providers.
+Each wrapper uses the create_providers factory to instantiate the right provider
+for a given agent. Defaults to "credential" for backward compatibility.
 """
 
 from typing import Any
 
 from auditkit.models import RawFinding
-from auditkit.providers import (
-    BanditProvider,
-    DetectSecretsProvider,
-    RuffProvider,
-)
+from auditkit.providers import create_providers
 
 
-def _collect(provider) -> list[RawFinding]:
-    """Collect all findings from a provider generator into a list."""
-    return list(provider.generate_audit_records())
+async def _collect(dir_path: str, agent: str = "credential", select: str | None = None) -> list[RawFinding]:
+    """Collect all findings from a provider into a list."""
+    providers = create_providers(dir_path, agent=agent, select=[select] if select else None)
+    if not providers:
+        return []
+    return [f async for f in providers[0].generate_audit_records()]
 
 
-def run_ruff(dir_path: str) -> list[RawFinding]:
-    return _collect(RuffProvider(dir_path))
+async def run_ruff(dir_path: str) -> list[RawFinding]:
+    return await _collect(dir_path, select="ruff")
 
 
-def run_bandit(dir_path: str) -> list[RawFinding]:
-    return _collect(BanditProvider(dir_path))
+async def run_bandit(dir_path: str) -> list[RawFinding]:
+    return await _collect(dir_path, select="bandit")
 
 
-def run_detect_secrets(dir_path: str) -> list[RawFinding]:
-    return _collect(DetectSecretsProvider(dir_path))
+async def run_detect_secrets(dir_path: str) -> list[RawFinding]:
+    return await _collect(dir_path, select="detect-secrets")
 
 
 # Registry of tool adapters — add new tools here

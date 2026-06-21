@@ -4,6 +4,7 @@ Validates that the scan JSONL, analyze JSON, and markdown report are
 internally consistent and cross-reference correctly.
 """
 
+import asyncio
 from pathlib import Path
 
 from auditkit.models import ScanEntry, ScanReport
@@ -54,14 +55,15 @@ def validate_cross_reference(scan_entries: list[ScanEntry], report: ScanReport) 
     return errors
 
 
-def validate_markdown(md_path: Path, report: ScanReport) -> list[str]:
+async def validate_markdown(md_path: Path, report: ScanReport) -> list[str]:
     """Check that the markdown report has required sections."""
     errors: list[str] = []
-    if not md_path.exists():
+    exists = await asyncio.to_thread(md_path.exists)
+    if not exists:
         errors.append(f"Markdown report not found: {md_path}")
         return errors
 
-    content = md_path.read_text(encoding="utf-8")
+    content = await asyncio.to_thread(md_path.read_text, encoding="utf-8")
     if "# Credential Scan Report" not in content:
         errors.append("Markdown missing: header (# Credential Scan Report)")
     if "**Directory:**" not in content:
@@ -75,7 +77,7 @@ def validate_markdown(md_path: Path, report: ScanReport) -> list[str]:
     return errors
 
 
-def validate_paths(scan_entries: list[ScanEntry]) -> list[str]:
+async def validate_paths(scan_entries: list[ScanEntry]) -> list[str]:
     """Check that file paths referenced in findings exist on disk."""
     base = Path.cwd()
     errors: list[str] = []
@@ -86,6 +88,7 @@ def validate_paths(scan_entries: list[ScanEntry]) -> list[str]:
             continue
         seen.add(fp)
         full = base / fp
-        if not full.exists():
+        exists = await asyncio.to_thread(full.exists)
+        if not exists:
             errors.append(f"File not found: {fp}")
     return errors

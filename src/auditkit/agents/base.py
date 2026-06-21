@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from auditkit.config import Settings
     from auditkit.models import ContextBlock, ScanReport
 
 
@@ -67,6 +68,7 @@ class SecurityAgent(ABC):
         self,
         blocks: list[ContextBlock],
         directory: str,
+        settings: Settings,
     ) -> ScanReport:
         """Run the agent on a single batch of pre-built context blocks.
 
@@ -75,4 +77,4 @@ class SecurityAgent(ABC):
         """
         from auditkit.agents.runner import classify_batch  # noqa: PLC0415
 
-        return await classify_batch(self, blocks, directory)
+        return await classify_batch(self, blocks, directory, settings)

@@ -5,6 +5,7 @@ with code snippets, and generates a markdown report for first-level
 human review.
 """
 
+import asyncio
 from datetime import UTC, datetime
 from itertools import groupby
 from pathlib import Path
@@ -45,7 +46,17 @@ def _format_snippet(lines: list[str], start: int, end: int, flagged: set[int]) -
     return "\n".join(parts)
 
 
-def build_context_blocks(findings: list[RawFinding]) -> list[ContextBlock]:
+async def _read_file_lines(file_path: str) -> list[str] | None:
+    """Async read file lines. Returns None if file does not exist."""
+    p = Path(file_path)
+    exists = await asyncio.to_thread(p.exists)
+    if not exists:
+        return None
+    content = await asyncio.to_thread(p.read_text, encoding="utf-8", errors="replace")
+    return content.split("\n")
+
+
+async def build_context_blocks(findings: list[RawFinding]) -> list[ContextBlock]:
     """Pre-context phase: one ContextBlock per finding, no merging.
 
     Each finding gets its own ±3 non-blank-line window. Blocks are
@@ -55,10 +66,9 @@ def build_context_blocks(findings: list[RawFinding]) -> list[ContextBlock]:
     blocks: list[ContextBlock] = []
 
     for file_path, group in groupby(findings_sorted, key=lambda f: f.file_path):
-        p = Path(file_path)
-        if not p.exists():
+        lines = await _read_file_lines(file_path)
+        if lines is None:
             continue
-        lines = p.read_text(encoding="utf-8", errors="replace").split("\n")
 
         for f in list(group):
             center = f.line_number - 1
@@ -66,7 +76,7 @@ def build_context_blocks(findings: list[RawFinding]) -> list[ContextBlock]:
             snippet = _format_snippet(lines, s, e, {f.line_number})
             blocks.append(
                 ContextBlock(
-                    file_path=str(p),
+                    file_path=file_path,
                     start_line=s + 1,
                     end_line=e,
                     finding_lines=[f.line_number],
@@ -91,24 +101,21 @@ def _rebuild_snippet(block: ContextBlock, file_lines: list[str]) -> ContextBlock
     return block
 
 
-def merge_context_blocks(blocks: list[ContextBlock]) -> list[ContextBlock]:
+async def merge_context_blocks(blocks: list[ContextBlock]) -> list[ContextBlock]:
     """Merge overlapping or adjacent context blocks within the same file.
 
     When multiple tools flag the same or nearby lines, their context
     windows may overlap. Consolidates them into expanded blocks with
     combined finding lists and re-extracted snippets.
     """
-    from itertools import groupby as _groupby
-
     merged: list[ContextBlock] = []
 
     blocks_sorted = sorted(blocks, key=lambda b: (b.file_path, b.start_line))
-    for file_path, file_group in _groupby(blocks_sorted, key=lambda b: b.file_path):
+    for file_path, file_group in groupby(blocks_sorted, key=lambda b: b.file_path):
         file_blocks = list(file_group)
-        p = Path(file_path)
-        if not p.exists():
+        file_lines = await _read_file_lines(file_path)
+        if file_lines is None:
             continue
-        file_lines = p.read_text(encoding="utf-8", errors="replace").split("\n")
 
         if not file_blocks:
             continue
@@ -142,16 +149,15 @@ def build_markdown_report(
     blocks: list[ContextBlock],
     directory: str,
     tools_used: list[str],
+    agent_name: str = "credential",
 ) -> str:
     """Generate a per-file markdown report — one section per file, one block per merged context."""
-    from itertools import groupby as _groupby
-
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     files_flagged = len({b.file_path for b in blocks})
     total_findings = sum(len(b.findings) for b in blocks)
 
     lines = [
-        "# Credential Scan Report",
+        f"# {agent_name.title()} Scan Report",
         "",
         f"**Directory:** `{directory}`  ",
         f"**Generated:** {now}  ",
@@ -164,8 +170,8 @@ def build_markdown_report(
     ]
 
     blocks_sorted = sorted(blocks, key=lambda b: (b.file_path, b.start_line))
-    for file_path, group in _groupby(blocks_sorted, key=lambda b: b.file_path):
-        file_blocks = list(group)
+    for file_path, _group in groupby(blocks_sorted, key=lambda b: b.file_path):
+        file_blocks = list(_group)
         name = Path(file_path).name
         lines.append(f"## {name}")
         lines.append("")
@@ -207,7 +213,7 @@ def _rule_label(rule_id: str) -> str:
     return _RULE_LABELS.get(rule_id, rule_id)
 
 
-def append_analysis_to_markdown(md_path: str, report: ScanReport) -> None:
+async def append_analysis_to_markdown(md_path: str, report: ScanReport) -> None:
     """Append the agent's classification to the markdown report."""
     lines = [
         "## Análise do Agente",
@@ -241,5 +247,11 @@ def append_analysis_to_markdown(md_path: str, report: ScanReport) -> None:
             ]
         )
 
-    with open(md_path, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    content = "\n".join(lines) + "\n"
+    await asyncio.to_thread(_append_to_file, md_path, content)
+
+
+def _append_to_file(path: str, content: str) -> None:
+    """Synchronous file append helper (called via asyncio.to_thread)."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(content)

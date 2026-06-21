@@ -1,19 +1,23 @@
 """Registry of available security analysis agents.
 
-New agents are registered here by adding their class to AVAILABLE_AGENTS.
+New agents are registered here by adding their class to the lazy-loaded
+dictionary.  No module-level global state is used — _load_agents() is
+called on demand and cached via functools.lru_cache.
 """
 
+import functools
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from auditkit.agents.base import SecurityAgent
 
 
-_AVAILABLE: dict[str, type[SecurityAgent]] | None = None
-
-
+@functools.lru_cache(maxsize=1)
 def _load_agents() -> dict[str, type[SecurityAgent]]:
-    """Lazy-load agent classes to avoid circular imports."""
+    """Lazy-load agent classes to avoid circular imports.
+
+    Result is cached via lru_cache so subsequent calls return instantly.
+    """
     from auditkit.agents.contexts.credential import CredentialAgent  # noqa: PLC0415
     from auditkit.agents.contexts.dependency import DependencyAgent  # noqa: PLC0415
     from auditkit.agents.contexts.injection import InjectionAgent  # noqa: PLC0415
@@ -25,16 +29,9 @@ def _load_agents() -> dict[str, type[SecurityAgent]]:
     }
 
 
-def _ensure_loaded() -> dict[str, type[SecurityAgent]]:
-    global _AVAILABLE  # noqa: PLW0603
-    if _AVAILABLE is None:
-        _AVAILABLE = _load_agents()
-    return _AVAILABLE
-
-
 def get_agent(name: str) -> type[SecurityAgent]:
     """Return the agent class registered under `name`."""
-    available = _ensure_loaded()
+    available = _load_agents()
     if name not in available:
         names = ", ".join(sorted(available))
         raise ValueError(f"Unknown agent '{name}'. Available: {names}")
@@ -43,7 +40,4 @@ def get_agent(name: str) -> type[SecurityAgent]:
 
 def list_agents() -> list[str]:
     """Return the names of all registered agents."""
-    return sorted(_ensure_loaded())
-
-
-AVAILABLE_AGENTS: dict[str, type[SecurityAgent]] = _ensure_loaded()
+    return sorted(_load_agents())

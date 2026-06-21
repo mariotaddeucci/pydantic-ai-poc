@@ -2,6 +2,8 @@
 
 Handles LLM setup, per-batch classification and report merging. Agent
 subclasses only define prompts and classification criteria.
+Settings are passed as a parameter rather than imported from a global
+singleton.
 """
 
 from __future__ import annotations
@@ -13,14 +15,15 @@ from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
 
-from auditkit.config import settings
 from auditkit.models import ContextBlock, ScanDeps, ScanReport
 
 if TYPE_CHECKING:
+    from auditkit.config import Settings
+
     from .base import SecurityAgent
 
 
-def _openai_model() -> OpenAIChatModel:
+def _openai_model(settings: Settings) -> OpenAIChatModel:
     if settings.openai_base_url:
         provider = OpenAIProvider(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
     else:
@@ -41,6 +44,7 @@ async def classify_batch(
     agent: SecurityAgent,
     blocks: list[ContextBlock],
     directory: str,
+    settings: Settings,
 ) -> ScanReport:
     """Run a single batch of context blocks through the given agent."""
     pydantic_agent = _build_agent(agent)
@@ -50,7 +54,7 @@ async def classify_batch(
     result = await pydantic_agent.run(
         prompt,
         deps=deps,
-        model=_openai_model(),
+        model=_openai_model(settings),
         model_settings=OpenAIChatModelSettings(extra_body={"thinking": {"type": "disabled"}}),
         usage_limits=UsageLimits(request_limit=200),
     )

@@ -1,8 +1,7 @@
 """Backward-compatible entry point for AI classification.
 
 The actual implementation now lives in auditkit.agents. This module re-exports
-the public symbols used by cli.py and pipeline.py so existing callers keep
-working without changes.
+the public symbols used by external callers.
 """
 
 from auditkit.agents.contexts.credential import CredentialAgent

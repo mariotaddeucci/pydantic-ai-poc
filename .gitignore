@@ -36,6 +36,6 @@ uv.lock
 .secrets.baseline
 
 # Generated scan reports
-**/credential_scan_report.md
+**/*_scan_report.md
 **/scan_results.jsonl
 **/analyze_results.json

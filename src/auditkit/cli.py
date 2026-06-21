@@ -1,24 +1,30 @@
 """CLI for credential scanner — multi-step pipeline with JSONL interchange.
 
 Commands:
-  scan     Run producers, build context, merge overlapping blocks, output JSONL.
-  report   Read JSONL, generate a markdown report with findings and code context.
-  analyze  Read JSONL, run the AI agent classifier in batches, output JSON report.
-  validate Validate the final scan report for consistency and completeness.
+  scan     Run scanning tools, merge context blocks, write JSONL.
+  report   Read JSONL, build context, write markdown report.
+  analyze  Read JSONL, run AI agent, dump ScanReport as JSON to stdout.
+  validate Read JSONL + analyze JSON, run validators, dump results as JSON.
+
+All I/O and subprocess calls are async under the hood.  Sync Typer commands
+wrap async helpers with asyncio.run().  Settings are created freshly per
+command (no global singleton).  Errors are logged as structured JSON to
+stderr.
 """
 
 import asyncio
 import json
 import sys
+import traceback
 from pathlib import Path
 
 import typer
 
 from auditkit.agents import classify_batch as agent_classify_batch
 from auditkit.agents import get_agent, list_agents, merge_reports
-from auditkit.config import settings
+from auditkit.config import Settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
-from auditkit.providers import AVAILABLE_PROVIDERS, PROFILE_RULES
+from auditkit.providers import AGENT_PROFILES, create_providers
 from auditkit.report_generator import (
     build_context_blocks,
     build_markdown_report,
@@ -34,291 +40,225 @@ from auditkit.validator import (
 app = typer.Typer(no_args_is_help=True)
 
 
-def _err(msg: str = "") -> None:
-    """Print to stderr."""
-    typer.echo(msg, err=True)
+def _stderr_json(**kwargs: object) -> None:
+    sys.stderr.write(json.dumps(kwargs, ensure_ascii=False) + "\n")
 
 
-def _filter_provider_names(select: str | None, exclude: str | None) -> list[str]:
-    """Apply --select / --exclude filters to provider names."""
+def _filter_provider_names(select: str | None, exclude: str | None, agent: str) -> list[str]:
+    available = set(AGENT_PROFILES.get(agent, {}))
     selected = {s.strip() for s in select.split(",")} if select else None
     excluded = {s.strip() for s in exclude.split(",")} if exclude else set()
-
     if selected is not None and excluded:
-        _err("Error: --select and --exclude are mutually exclusive.")
+        _stderr_json(error="--select and --exclude are mutually exclusive")
+        raise typer.Exit(2)
+    if selected is not None:
+        invalid = selected - available
+        if invalid:
+            _stderr_json(error=f"Unknown tool(s): {', '.join(sorted(invalid))}", agent=agent)
+            raise typer.Exit(2)
+        return [n for n in available if n in selected]
+    return [n for n in available if n not in excluded]
+
+
+async def _read_jsonl(path: str | None) -> list[ScanEntry]:
+    def _read(lines):
+        return [ScanEntry.model_validate_json(line) for line in lines if line.strip()]
+
+    if path:
+        p = Path(path)
+        if not await asyncio.to_thread(p.exists):
+            _stderr_json(error=f"File not found: {path}")
+            raise typer.Exit(1)
+
+        def _from_file() -> list[ScanEntry]:
+            with open(p, encoding="utf-8") as f:
+                return _read(f)
+
+        return await asyncio.to_thread(_from_file)
+
+    stdin = await asyncio.to_thread(sys.stdin.read)
+    return _read(stdin.split("\n"))
+
+
+def _wrap_async(coro):
+    try:
+        asyncio.run(coro)
+    except typer.Exit:
+        raise
+    except Exception:
+        _stderr_json(error=traceback.format_exc())
+        raise typer.Exit(1) from None
+
+
+# ── Scan ──────────────────────────────────────────────────────────────────
+
+
+async def _scan(
+    directory: str,
+    output: str | None,
+    select: str | None,
+    exclude: str | None,
+    agent: str,
+) -> None:
+    if agent not in AGENT_PROFILES:
+        _stderr_json(error=f"Unknown agent '{agent}'", available=sorted(AGENT_PROFILES))
         raise typer.Exit(2)
 
-    if selected is not None:
-        return [n for n in AVAILABLE_PROVIDERS if n in selected]
-    return [n for n in AVAILABLE_PROVIDERS if n not in excluded]
+    names = _filter_provider_names(select, exclude, agent)
+    if not names:
+        return
+
+    all_findings: list[RawFinding] = []
+    for name in names:
+        try:
+            provider = create_providers(directory, agent=agent, select=[name])[0]
+            async for finding in provider.generate_audit_records():
+                all_findings.append(finding)  # noqa: PERF401
+        except Exception as e:
+            _stderr_json(warning=f"{name} skipped", reason=str(e))
+
+    if not all_findings:
+        return
+
+    blocks = await build_context_blocks(all_findings)
+    merged = await merge_context_blocks(blocks)
+
+    entries = [ScanEntry(finding=f, snippet=b.snippet) for b in merged for f in b.findings]
+    lines = "\n".join(e.model_dump_json() for e in entries) + "\n"
+    out_path = await asyncio.to_thread(lambda: output or str(Path(directory).resolve() / "scan_results.jsonl"))
+    await asyncio.to_thread(Path(out_path).write_text, lines, encoding="utf-8")
 
 
 @app.command()
 def scan(
-    directory: str = typer.Argument(".", help="Directory to scan for credentials"),
-    output: str | None = typer.Option(
-        None, "--output", "-o", help="JSONL output file (default: <directory>/scan_results.jsonl)"
+    directory: str = typer.Argument(".", help="Directory to scan"),
+    output: str | None = typer.Option(None, "--output", "-o", help="JSONL output path"),
+    select: str | None = typer.Option(None, "--select", help="Comma-separated tools to run"),
+    exclude: str | None = typer.Option(None, "--exclude", help="Comma-separated tools to skip"),
+    agent: str = typer.Option(
+        "credential", "--agent", "-a", help=f"Agent profile. Available: {', '.join(sorted(AGENT_PROFILES))}"
     ),
-    select: str | None = typer.Option(None, "--select", help="Comma-separated tool names to run (default: all)"),
-    exclude: str | None = typer.Option(None, "--exclude", help="Comma-separated tool names to skip (default: none)"),
-    profile: str = typer.Option("secret-scan", "--profile", "-p", help="Scan profile with pre-configured rules"),
 ):
-    """Scan a directory for hardcoded credentials.
+    _wrap_async(_scan(directory, output, select, exclude, agent))
 
-    Runs all registered providers (ruff, bandit, detect-secrets) by default.
-    Use --select to run only specific tools or --exclude to skip some.
-    Use --profile to pick a pre-configured rule set (default: secret-scan).
-    Merges overlapping context blocks from different tools into consolidated snippets.
-    Outputs one JSONL line per finding.
-    """
-    if profile not in PROFILE_RULES:
-        _err(f"Unknown profile: {profile}. Available: {', '.join(sorted(PROFILE_RULES))}")
-        raise typer.Exit(2)
 
-    _err(f"Scanning: {directory} (profile: {profile})")
+# ── Report ─────────────────────────────────────────────────────────────────
 
-    names = _filter_provider_names(select, exclude)
-    if not names:
-        _err("No tools selected — nothing to run.")
+
+async def _report(jsonl_file: str | None, output: str | None, directory: str | None, agent: str) -> None:
+    entries = await _read_jsonl(jsonl_file)
+    findings = [e.finding for e in entries]
+    if not findings:
         return
 
-    profile_rules = PROFILE_RULES[profile]
-    all_findings: list[RawFinding] = []
-    for name in names:
-        _err(f"  Running {name}...")
-        try:
-            provider_cls = AVAILABLE_PROVIDERS[name]
-            rules = profile_rules.get(name, [])
-            provider = provider_cls(directory, rules=rules)
-            count = 0
-            for finding in provider.generate_audit_records():
-                all_findings.append(finding)
-                count += 1
-            _err(f"    {count} finding(s)")
-        except Exception as e:
-            _err(f"    Skipped: {e}")
+    label = directory or (str(Path(jsonl_file).parent) if jsonl_file else ".")
+    blocks = await build_context_blocks(findings)
+    merged = await merge_context_blocks(blocks)
+    tools = sorted({f.tool_name for f in findings})
+    md = build_markdown_report(merged, label, tools, agent_name=agent)
 
-    _err(f"Total raw findings: {len(all_findings)}")
-    if not all_findings:
-        _err("No security issues found.")
-        return
-
-    blocks = build_context_blocks(all_findings)
-    _err(f"Context blocks (pre-merge): {len(blocks)}")
-
-    merged = merge_context_blocks(blocks)
-    _err(f"Context blocks (post-merge): {len(merged)}")
-
-    entries = [ScanEntry(finding=f, snippet=b.snippet) for b in merged for f in b.findings]
-
-    lines = "\n".join(e.model_dump_json() for e in entries) + "\n"
-    out_file = output or str(Path(directory).resolve() / "scan_results.jsonl")
-    Path(out_file).write_text(lines, encoding="utf-8")
-    _err(f"JSONL saved: {out_file} ({len(entries)} entries)")
-
-
-def _read_jsonl(jsonl_file: str | None) -> list[ScanEntry]:
-    """Read ScanEntry items from a JSONL file or stdin."""
-    entries: list[ScanEntry] = []
-    if jsonl_file:
-        p = Path(jsonl_file)
-        if not p.exists():
-            _err(f"File not found: {jsonl_file}")
-            raise typer.Exit(1)
-        source = open(p, encoding="utf-8")
-    else:
-        source = sys.stdin
-    with source:
-        for raw_line in source:
-            line = raw_line.strip()
-            if not line:
-                continue
-            entries.append(ScanEntry.model_validate_json(line))
-    return entries
+    out = Path(output) if output else Path(label) / f"{agent}_scan_report.md"
+    await asyncio.to_thread(out.write_text, md, encoding="utf-8")
 
 
 @app.command()
 def report(
-    jsonl_file: str | None = typer.Argument(None, help="JSONL file from the scan command (or stdin)"),
-    output: str | None = typer.Option(
-        None, "--output", "-o", help="Markdown output file (default: <jsonl_dir>/credential_scan_report.md)"
-    ),
-    directory: str | None = typer.Option(None, "--directory", "-d", help="Directory label in the report header"),
+    jsonl_file: str | None = typer.Argument(None, help="JSONL input (or stdin)"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Markdown output path"),
+    directory: str | None = typer.Option(None, "--directory", "-d", help="Directory label"),
+    agent: str = typer.Option("credential", "--agent", "-a", help="Agent context for report title"),
 ):
-    """Generate a markdown report from JSONL scan results.
+    _wrap_async(_report(jsonl_file, output, directory, agent))
 
-    Reads findings from a JSONL file (or stdin), rebuilds context blocks,
-    merges them, and exports a markdown report with code snippets for each
-    finding. No AI agent is invoked — this is the first-level human review report.
-    """
-    entries = _read_jsonl(jsonl_file)
-    all_findings = [e.finding for e in entries]
-    dir_label = directory or (str(Path(jsonl_file).parent) if jsonl_file else ".")
 
-    if not all_findings:
-        _err("No findings to report.")
-        return
+# ── Analyze ────────────────────────────────────────────────────────────────
 
-    blocks = build_context_blocks(all_findings)
-    merged = merge_context_blocks(blocks)
-    tools = sorted({f.tool_name for f in all_findings})
-    md_content = build_markdown_report(merged, dir_label, tools)
 
-    out_path = Path(output) if output else Path(dir_label) / "credential_scan_report.md"
-    out_path.write_text(md_content, encoding="utf-8")
-    _err(f"Report saved: {out_path}")
-    _err(f"  Files flagged: {len({b.file_path for b in merged})}")
-    _err(f"  Context blocks: {len(merged)}")
-    _err(f"  Findings: {len(all_findings)}")
+async def _analyze(
+    jsonl_file: str | None,
+    directory: str | None,
+    agent: str | None,
+) -> None:
+    settings = Settings()
+    if not settings.openai_api_key:
+        _stderr_json(error="OPENAI_API_KEY not set")
+        raise typer.Exit(1)
+
+    agent_name = agent or settings.openai_default_agent
+    try:
+        instance = get_agent(agent_name).create()
+    except ValueError as e:
+        _stderr_json(error=str(e))
+        raise typer.Exit(2) from None
+
+    entries = await _read_jsonl(jsonl_file)
+    findings = [e.finding for e in entries]
+    label = directory or (str(Path(jsonl_file).parent) if jsonl_file else ".")
+
+    files = list(dict.fromkeys(f.file_path for f in findings))
+    batches = [files[i : i + instance.batch_size] for i in range(0, len(files), instance.batch_size)]
+
+    reports: list[ScanReport] = []
+    for batch in batches:
+        batch_set = set(batch)
+        batch_findings = [f for f in findings if f.file_path in batch_set]
+        blocks = await build_context_blocks(batch_findings)
+        blocks = await merge_context_blocks(blocks)
+        report = await agent_classify_batch(instance, blocks, label, settings)
+        reports.append(report)
+
+    final = merge_reports(reports, label)
+    sys.stdout.write(final.model_dump_json(indent=2, ensure_ascii=False) + "\n")
 
 
 @app.command()
 def analyze(
-    jsonl_file: str | None = typer.Argument(None, help="JSONL file from the scan command (or stdin)"),
-    directory: str | None = typer.Option(None, "--directory", "-d", help="Override report directory label"),
-    agent: str = typer.Option(
-        settings.openai_default_agent,
-        "--agent",
-        "-a",
-        help=f"Agent context to use. Available: {', '.join(list_agents())}",
-    ),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress status output, print only JSON"),
+    jsonl_file: str | None = typer.Argument(None, help="JSONL input (or stdin)"),
+    directory: str | None = typer.Option(None, "--directory", "-d", help="Directory label"),
+    agent: str | None = typer.Option(None, "--agent", "-a", help=f"Agent. Available: {', '.join(list_agents())}"),
 ):
-    """Analyze JSONL scan results with the selected AI security agent.
+    _wrap_async(_analyze(jsonl_file, directory, agent))
 
-    Reads findings from a JSONL file (or stdin), groups by file, runs the
-    chosen agent in batches, and prints the final ScanReport as JSON to stdout.
-    """
-    if not settings.openai_api_key:
-        _err("Erro: OPENAI_API_KEY nao definida.")
-        _err("Copie .env.example para .env e preencha sua chave da OpenAI.")
+
+# ── Validate ──────────────────────────────────────────────────────────────
+
+
+async def _validate(jsonl_file: str | None, analyze_path: str | None, report_md: str | None, agent: str) -> None:
+    entries = await _read_jsonl(jsonl_file)
+    base = Path(jsonl_file).parent if jsonl_file else Path.cwd()
+
+    if analyze_path:
+        content = await asyncio.to_thread(Path(analyze_path).read_text, encoding="utf-8")
+        report = ScanReport.model_validate_json(content)
+    else:
+        stdin_data = await asyncio.to_thread(sys.stdin.read)
+        if not stdin_data.strip():
+            _stderr_json(error="Provide --analyze or pipe analyze JSON via stdin")
+            raise typer.Exit(1)
+        report = ScanReport.model_validate_json(stdin_data)
+
+    md_path = Path(report_md) if report_md else base / f"{agent}_scan_report.md"
+
+    errors: dict[str, list[str]] = {
+        "counts": validate_counts(report),
+        "cross_reference": validate_cross_reference(entries, report),
+        "markdown": await validate_markdown(md_path, report),
+        "paths": await validate_paths(entries),
+    }
+
+    sys.stdout.write(json.dumps(errors, indent=2, ensure_ascii=False) + "\n")
+    if any(v for v in errors.values()):
         raise typer.Exit(1)
-
-    try:
-        agent_instance = get_agent(agent).create()
-    except ValueError as e:
-        _err(f"Error: {e}")
-        raise typer.Exit(2) from e
-
-    entries = _read_jsonl(jsonl_file)
-    all_findings = [e.finding for e in entries]
-    dir_label = directory or (str(Path(jsonl_file).parent) if jsonl_file else ".")
-
-    if not quiet:
-        _err(f"Loaded {len(all_findings)} findings")
-        _err(f"Agent: {agent_instance.name} — {agent_instance.description}")
-
-    files_flagged = list(dict.fromkeys(f.file_path for f in all_findings))
-    batch_size = agent_instance.batch_size
-    batches = [files_flagged[i : i + batch_size] for i in range(0, len(files_flagged), batch_size)]
-    if not quiet:
-        _err(f"Files flagged: {len(files_flagged)}")
-        _err(f"Batches: {len(batches)} ({batch_size} files each)")
-
-    async def _run():
-        reports: list[ScanReport] = []
-        for i, batch_files in enumerate(batches, 1):
-            batch_set = set(batch_files)
-            batch_findings = [f for f in all_findings if f.file_path in batch_set]
-            batch_blocks = build_context_blocks(batch_findings)
-            batch_blocks = merge_context_blocks(batch_blocks)
-
-            if not quiet:
-                _err(f"  Batch {i}/{len(batches)} — {len(batch_files)} file(s)")
-                for bf in batch_files:
-                    _err(f"    {bf}")
-
-            report = await agent_classify_batch(agent_instance, batch_blocks, dir_label)
-            reports.append(report)
-            if not quiet:
-                _err(
-                    f"    → {report.total_findings} analysed, "
-                    f"exposed={report.exposed}, uncertain={report.uncertain}, "
-                    f"false_positives={report.false_positives}"
-                )
-
-        final = merge_reports(reports, dir_label)
-        sys.stdout.write(json.dumps(final.model_dump(), indent=2, ensure_ascii=False) + "\n")
-
-    asyncio.run(_run())
-
-
-# ── Validate command ────────────────────────────────────────────────────
 
 
 @app.command()
 def validate(
-    jsonl_file: str | None = typer.Argument(None, help="JSONL file from the scan command (or stdin)"),
-    analyze_json: str | None = typer.Option(
-        None, "--analyze", "-a", help="JSON output from the analyze command (or stdin)"
-    ),
-    report_md: str | None = typer.Option(
-        None, "--report", "-r", help="Markdown report file (default: <jsonl_dir>/credential_scan_report.md)"
-    ),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help="Only print errors (no OK lines)"),
+    jsonl_file: str | None = typer.Argument(None, help="JSONL input (or stdin)"),
+    analyze_json: str | None = typer.Option(None, "--analyze", "-a", help="Analyze JSON path (or stdin)"),
+    report_md: str | None = typer.Option(None, "--report", "-r", help="Markdown report path"),
+    agent: str = typer.Option("credential", "--agent", help="Agent context for report filename"),
 ):
-    """Validate the final scan report for consistency and completeness.
-
-    Cross-references the JSONL scan results with the AI analyze output and the
-    markdown report. Checks internal count consistency, missing/orphan findings,
-    markdown structure, and file path existence on disk.
-
-    Exit code 0 if all validations pass, 1 if any fail.
-    """
-    entries = _read_jsonl(jsonl_file)
-    if not entries:
-        _err("No scan entries to validate.")
-        raise typer.Exit(0)
-
-    # Determine base directory from jsonl_file location
-    base_dir = Path(jsonl_file).parent if jsonl_file else Path.cwd()
-
-    # Read analyze JSON
-    if analyze_json:
-        analyze_path = Path(analyze_json)
-        if not analyze_path.exists():
-            _err(f"Analyze JSON file not found: {analyze_json}")
-            raise typer.Exit(1)
-        report = ScanReport.model_validate_json(analyze_path.read_text(encoding="utf-8"))
-    else:
-        # Try reading from stdin
-        if sys.stdin.isatty():
-            _err("No analyze JSON provided (use --analyze or pipe via stdin).")
-            raise typer.Exit(1)
-        report = ScanReport.model_validate_json(sys.stdin.read())
-
-    # Determine markdown path
-    md_path = Path(report_md) if report_md else base_dir / "credential_scan_report.md"
-
-    all_errors: list[str] = []
-
-    def check(name: str, errors: list[str]) -> bool:
-        ok = len(errors) == 0
-        if not quiet:
-            status = "✓" if ok else "✗"
-            _err(f"  {status} {name}")
-        if not ok:
-            for e in errors:
-                all_errors.append(f"[{name}] {e}")
-                _err(f"      {e}")
-        return ok
-
-    all_ok = True
-
-    all_ok &= check("Internal counts", validate_counts(report))
-    all_ok &= check("Cross-reference (scan ↔ analyze)", validate_cross_reference(entries, report))
-    all_ok &= check("Markdown structure", validate_markdown(md_path, report))
-    all_ok &= check("File paths existence", validate_paths(entries))
-
-    if not quiet:
-        _err("")
-        if all_ok:
-            _err("All validations passed.")
-        else:
-            _err(f"{len(all_errors)} validation error(s) found.")
-
-    if not all_ok:
-        raise typer.Exit(1)
+    _wrap_async(_validate(jsonl_file, analyze_json, report_md, agent))
 
 
 if __name__ == "__main__":

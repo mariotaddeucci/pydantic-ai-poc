@@ -1,15 +1,17 @@
-"""Abstract credential scanning providers with profile-based rule configuration.
+"""Provider system with agent-driven configuration.
 
 Each provider extends BaseCredentialProvider and implements generate_audit_records()
-as a generator. The factory create_providers() instantiates all providers for a given
-profile.
+as an async generator. PROVIDER_REGISTRY maps names to (module, class) strings for
+lazy loading. AGENT_PROFILES maps agent names to their provider configurations.
+The factory create_providers() instantiates providers for a given agent.
 """
 
+import asyncio
+import importlib
 import json
-import subprocess
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Generator
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -40,8 +42,8 @@ def _normalize_path(file_path: str) -> str:
 class BaseCredentialProvider(ABC):
     """Abstract base for credential scanning providers.
 
-    Subclasses implement generate_audit_records() as a generator that yields
-    RawFinding objects.
+    Subclasses implement generate_audit_records() as an async generator
+    that yields RawFinding objects.
     """
 
     def __init__(self, target_directory: str, rules: list[str] | None = None):
@@ -49,9 +51,10 @@ class BaseCredentialProvider(ABC):
         self.rules = rules or []
 
     @abstractmethod
-    def generate_audit_records(self) -> Generator[RawFinding]:
+    async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
         """Yield RawFinding objects for the target directory."""
-        ...
+        if False:  # pragma: no cover (makes the generator valid)
+            yield
 
 
 # ── Ruff provider ───────────────────────────────────────────────────
@@ -76,30 +79,30 @@ RUFF_DEFAULT_RULES = ["S105", "S106", "S107"]
 class RuffProvider(BaseCredentialProvider):
     """Runs ruff with credential-focused rules."""
 
-    def generate_audit_records(self) -> Generator[RawFinding]:
+    async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
         rules_to_run = self.rules if self.rules else RUFF_DEFAULT_RULES
         rules = ",".join(rules_to_run)
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "ruff",
-                "check",
-                "--output-format",
-                "json",
-                "--select",
-                rules,
-                str(self.target_directory),
-            ],
-            capture_output=True,
-            text=True,
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "--output-format",
+            "json",
+            "--select",
+            rules,
+            str(self.target_directory),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode not in (0, 1):
-            raise RuntimeError(f"ruff failed: {result.stderr.strip()}")
-        if not result.stdout.strip():
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(f"ruff failed: {stderr_bytes.decode().strip()}")
+        stdout = stdout_bytes.decode()
+        if not stdout.strip():
             return
 
-        for item in json.loads(result.stdout):
+        for item in json.loads(stdout):
             try:
                 f = _RuffFinding.model_validate(item)
             except Exception:
@@ -126,18 +129,28 @@ BANDIT_DEFAULT_RULES = ["B105", "B106", "B107"]
 class BanditProvider(BaseCredentialProvider):
     """Runs bandit with credential-focused rules."""
 
-    def generate_audit_records(self) -> Generator[RawFinding]:
-        result = subprocess.run(
-            [sys.executable, "-m", "bandit", "-r", "-f", "json", "-l", "-i", str(self.target_directory)],
-            capture_output=True,
-            text=True,
+    async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "bandit",
+            "-r",
+            "-f",
+            "json",
+            "-l",
+            "-i",
+            str(self.target_directory),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode not in (0, 1):
-            raise RuntimeError(f"bandit failed: {result.stderr.strip()}")
-        if not result.stdout.strip():
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(f"bandit failed: {stderr_bytes.decode().strip()}")
+        stdout = stdout_bytes.decode()
+        if not stdout.strip():
             return
 
-        raw_results: list[dict] = json.loads(result.stdout).get("results", [])
+        raw_results: list[dict] = json.loads(stdout).get("results", [])
         rules_to_run = self.rules if self.rules else BANDIT_DEFAULT_RULES
         for item in raw_results:
             test_id = item.get("test_id", "")
@@ -167,18 +180,25 @@ class BanditProvider(BaseCredentialProvider):
 class DetectSecretsProvider(BaseCredentialProvider):
     """Runs detect-secrets against the target directory."""
 
-    def generate_audit_records(self) -> Generator[RawFinding]:
-        result = subprocess.run(
-            [sys.executable, "-m", "detect_secrets", "scan", "--all-files", str(self.target_directory)],
-            capture_output=True,
-            text=True,
+    async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "detect_secrets",
+            "scan",
+            "--all-files",
+            str(self.target_directory),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode not in (0, 1):
-            raise RuntimeError(f"detect-secrets failed: {result.stderr.strip()}")
-        if not result.stdout.strip():
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(f"detect-secrets failed: {stderr_bytes.decode().strip()}")
+        stdout = stdout_bytes.decode()
+        if not stdout.strip():
             return
 
-        raw_results: dict = json.loads(result.stdout).get("results", {})
+        raw_results: dict = json.loads(stdout).get("results", {})
         for filename, entries in raw_results.items():
             file_path = _normalize_path(filename)
             if _is_ignored(file_path):
@@ -200,33 +220,56 @@ class DetectSecretsProvider(BaseCredentialProvider):
 # ── Registry & factory ──────────────────────────────────────────────
 
 
-AVAILABLE_PROVIDERS: dict[str, type[BaseCredentialProvider]] = {
-    "ruff": RuffProvider,
-    "bandit": BanditProvider,
-    "detect-secrets": DetectSecretsProvider,
+PROVIDER_REGISTRY: dict[str, dict[str, str]] = {
+    "ruff": {
+        "module": "auditkit.providers",
+        "class_name": "RuffProvider",
+    },
+    "bandit": {
+        "module": "auditkit.providers",
+        "class_name": "BanditProvider",
+    },
+    "detect-secrets": {
+        "module": "auditkit.providers",
+        "class_name": "DetectSecretsProvider",
+    },
 }
 
-PROFILE_RULES: dict[str, dict[str, list[str]]] = {
-    "secret-scan": {
-        "ruff": ["S105", "S106", "S107"],
-        "bandit": ["B105", "B106", "B107"],
-        "detect-secrets": [],
+AGENT_PROFILES: dict[str, dict[str, dict[str, list[str]]]] = {
+    "credential": {
+        "ruff": {"rules": ["S105", "S106", "S107"]},
+        "bandit": {"rules": ["B105", "B106", "B107"]},
+        "detect-secrets": {"rules": []},
     },
+    "injection": {
+        "ruff": {"rules": ["S602", "S603", "S604", "S606", "S607"]},
+        "bandit": {"rules": ["B601", "B602", "B603", "B604", "B608"]},
+    },
+    "dependency": {},
 }
 
 
 def create_providers(
     directory: str,
-    profile: str = "secret-scan",
+    agent: str = "credential",
+    select: list[str] | None = None,
 ) -> list[BaseCredentialProvider]:
-    """Instantiate all registered providers with rules from the given profile."""
-    if profile not in PROFILE_RULES:
-        available = ", ".join(PROFILE_RULES)
-        raise ValueError(f"Unknown profile '{profile}'. Available: {available}")
+    """Instantiate providers configured for the given agent.
 
-    profile_rules = PROFILE_RULES[profile]
+    Uses lazy imports (importlib.import_module) so provider classes are
+    loaded only on demand. The select parameter filters by provider name.
+    """
+    if agent not in AGENT_PROFILES:
+        available = ", ".join(sorted(AGENT_PROFILES))
+        raise ValueError(f"Unknown agent '{agent}'. Available: {available}")
+
+    agent_providers = AGENT_PROFILES[agent]
     providers: list[BaseCredentialProvider] = []
-    for name, cls in AVAILABLE_PROVIDERS.items():
-        rules = profile_rules.get(name, [])
-        providers.append(cls(directory, rules=rules))
+    for provider_name, kwargs in agent_providers.items():
+        if select is not None and provider_name not in select:
+            continue
+        spec = PROVIDER_REGISTRY[provider_name]
+        mod = importlib.import_module(spec["module"])
+        cls = getattr(mod, spec["class_name"])
+        providers.append(cls(directory, **kwargs))
     return providers
