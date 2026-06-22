@@ -1,15 +1,7 @@
-"""CLI for credential scanner — multi-step pipeline with JSONL interchange.
+"""CLI — scan, report, analyze, validate.
 
-Commands:
-  scan     Run scanning tools, merge context blocks, write JSONL.
-  report   Read JSONL, build context, write markdown report.
-  analyze  Read JSONL, run AI agent, dump ScanReport as JSON to stdout.
-  validate Read JSONL + analyze JSON, run validators, dump results as JSON.
-
-All I/O and subprocess calls are async under the hood.  Sync Typer commands
-wrap async helpers with asyncio.run().  Settings are created freshly per
-command (no global singleton).  Errors are logged as structured JSON to
-stderr.
+All I/O and subprocess calls are async. Sync Typer commands wrap async
+helpers with asyncio.run(). Settings created freshly per command.
 """
 
 import asyncio
@@ -20,16 +12,13 @@ from pathlib import Path
 
 import typer
 
-from auditkit.agents import classify_batch as agent_classify_batch
-from auditkit.agents import get_agent, list_agents, merge_reports
+from auditkit.classifier import classify_batch as agent_classify_batch
+from auditkit.classifier import get_agent, list_agents, merge_reports
 from auditkit.config import Settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
-from auditkit.providers import AGENT_PROFILES, create_providers
-from auditkit.report_generator import (
-    build_context_blocks,
-    build_markdown_report,
-    merge_context_blocks,
-)
+from auditkit.reporter.context import build_context_blocks, merge_context_blocks
+from auditkit.reporter.markdown import build_markdown_report
+from auditkit.scanner import AGENT_PROFILES, create_providers, filter_provider_names
 from auditkit.validator import (
     validate_counts,
     validate_cross_reference,
@@ -42,22 +31,6 @@ app = typer.Typer(no_args_is_help=True)
 
 def _stderr_json(**kwargs: object) -> None:
     sys.stderr.write(json.dumps(kwargs, ensure_ascii=False) + "\n")
-
-
-def _filter_provider_names(select: str | None, exclude: str | None, agent: str) -> list[str]:
-    available = set(AGENT_PROFILES.get(agent, {}))
-    selected = {s.strip() for s in select.split(",")} if select else None
-    excluded = {s.strip() for s in exclude.split(",")} if exclude else set()
-    if selected is not None and excluded:
-        _stderr_json(error="--select and --exclude are mutually exclusive")
-        raise typer.Exit(2)
-    if selected is not None:
-        invalid = selected - available
-        if invalid:
-            _stderr_json(error=f"Unknown tool(s): {', '.join(sorted(invalid))}", agent=agent)
-            raise typer.Exit(2)
-        return [n for n in available if n in selected]
-    return [n for n in available if n not in excluded]
 
 
 async def _read_jsonl(path: str | None) -> list[ScanEntry]:
@@ -90,7 +63,7 @@ def _wrap_async(coro):
         raise typer.Exit(1) from None
 
 
-# ── Scan ──────────────────────────────────────────────────────────────────
+# ── Scan ──────────────────────────────────────────────────────────────
 
 
 async def _scan(
@@ -104,7 +77,7 @@ async def _scan(
         _stderr_json(error=f"Unknown agent '{agent}'", available=sorted(AGENT_PROFILES))
         raise typer.Exit(2)
 
-    names = _filter_provider_names(select, exclude, agent)
+    names = filter_provider_names(select, exclude, agent)
     if not names:
         return
 
@@ -136,13 +109,16 @@ def scan(
     select: str | None = typer.Option(None, "--select", help="Comma-separated tools to run"),
     exclude: str | None = typer.Option(None, "--exclude", help="Comma-separated tools to skip"),
     agent: str = typer.Option(
-        "credential", "--agent", "-a", help=f"Agent profile. Available: {', '.join(sorted(AGENT_PROFILES))}"
+        "credential",
+        "--agent",
+        "-a",
+        help=f"Agent profile. Available: {', '.join(sorted(AGENT_PROFILES))}",
     ),
 ):
     _wrap_async(_scan(directory, output, select, exclude, agent))
 
 
-# ── Report ─────────────────────────────────────────────────────────────────
+# ── Report ────────────────────────────────────────────────────────────
 
 
 async def _report(jsonl_file: str | None, output: str | None, directory: str | None, agent: str) -> None:
@@ -171,7 +147,7 @@ def report(
     _wrap_async(_report(jsonl_file, output, directory, agent))
 
 
-# ── Analyze ────────────────────────────────────────────────────────────────
+# ── Analyze ───────────────────────────────────────────────────────────
 
 
 async def _analyze(
@@ -186,7 +162,7 @@ async def _analyze(
 
     agent_name = agent or settings.openai_default_agent
     try:
-        instance = get_agent(agent_name).create()
+        instance = get_agent(agent_name)
     except ValueError as e:
         _stderr_json(error=str(e))
         raise typer.Exit(2) from None
@@ -220,7 +196,7 @@ def analyze(
     _wrap_async(_analyze(jsonl_file, directory, agent))
 
 
-# ── Validate ──────────────────────────────────────────────────────────────
+# ── Validate ──────────────────────────────────────────────────────────
 
 
 async def _validate(jsonl_file: str | None, analyze_path: str | None, report_md: str | None, agent: str) -> None:
@@ -242,7 +218,7 @@ async def _validate(jsonl_file: str | None, analyze_path: str | None, report_md:
     errors: dict[str, list[str]] = {
         "counts": validate_counts(report),
         "cross_reference": validate_cross_reference(entries, report),
-        "markdown": await validate_markdown(md_path, report),
+        "markdown": await validate_markdown(md_path, report, agent),
         "paths": await validate_paths(entries),
     }
 

@@ -55,7 +55,7 @@ def validate_cross_reference(scan_entries: list[ScanEntry], report: ScanReport) 
     return errors
 
 
-async def validate_markdown(md_path: Path, report: ScanReport) -> list[str]:
+async def validate_markdown(md_path: Path, report: ScanReport, agent: str = "credential") -> list[str]:
     """Check that the markdown report has required sections."""
     errors: list[str] = []
     exists = await asyncio.to_thread(md_path.exists)
@@ -64,8 +64,9 @@ async def validate_markdown(md_path: Path, report: ScanReport) -> list[str]:
         return errors
 
     content = await asyncio.to_thread(md_path.read_text, encoding="utf-8")
-    if "# Credential Scan Report" not in content:
-        errors.append("Markdown missing: header (# Credential Scan Report)")
+    expected_title = f"# {agent.title()} Scan Report"
+    if expected_title not in content:
+        errors.append(f"Markdown missing: header ({expected_title})")
     if "**Directory:**" not in content:
         errors.append("Markdown missing: directory metadata")
     if "**Tools:**" not in content:

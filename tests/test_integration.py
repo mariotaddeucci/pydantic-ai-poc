@@ -1,9 +1,4 @@
-"""Integration test — runs full scan pipeline against examples and validates results.
-
-Usage:
-  uv run python -m pytest tests/test_integration.py -v
-  uv run python tests/test_integration.py
-"""
+"""Integration tests — run full scan pipeline against examples and validate results."""
 
 import asyncio
 import json
@@ -47,7 +42,7 @@ def _is_api_key_set() -> bool:
 
 
 def test_agent_registry_contains_default_agents():
-    from auditkit.agents import list_agents
+    from auditkit.classifier import list_agents
 
     agents = list_agents()
     assert "credential" in agents
@@ -56,19 +51,23 @@ def test_agent_registry_contains_default_agents():
     assert len(agents) == 3
 
 
-def test_get_agent_returns_expected_classes():
-    from auditkit.agents import get_agent
-    from auditkit.agents.contexts.credential import CredentialAgent
-    from auditkit.agents.contexts.dependency import DependencyAgent
-    from auditkit.agents.contexts.injection import InjectionAgent
+def test_get_agent_returns_config():
+    from auditkit.classifier import get_agent
 
-    assert get_agent("credential") is CredentialAgent
-    assert get_agent("injection") is InjectionAgent
-    assert get_agent("dependency") is DependencyAgent
+    config = get_agent("credential")
+    assert config.name == "credential"
+    assert config.description
+    assert config.system_prompt
+
+    config = get_agent("injection")
+    assert config.name == "injection"
+
+    config = get_agent("dependency")
+    assert config.name == "dependency"
 
 
-def test_get_agent_raises_for_unknown_agent():
-    from auditkit.agents import get_agent
+def test_get_agent_raises_for_unknown():
+    from auditkit.classifier import get_agent
 
     with pytest.raises(ValueError, match="Unknown agent"):
         get_agent("nonexistent")
@@ -91,9 +90,7 @@ def clean_examples_dir() -> Generator[None]:
 
 
 def test_scan_all_tools():
-    """Scan examples with all providers — should find findings from every tool."""
     result = _run_cli("scan", str(EXAMPLES_DIR), "-o", str(EXAMPLES_DIR / "scan_results.jsonl"))
-
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
     jsonl_path = EXAMPLES_DIR / "scan_results.jsonl"
@@ -140,7 +137,6 @@ def test_scan_exclude_bandit():
 
 
 def test_report_generation():
-    """Generate markdown report from JSONL."""
     scan_result = _run_cli("scan", str(EXAMPLES_DIR), "-o", str(EXAMPLES_DIR / "scan_results.jsonl"))
     assert scan_result.returncode == 0
 
@@ -162,7 +158,6 @@ def test_report_generation():
 
 
 def test_validate_without_analyze():
-    """Validate reports missing analyze JSON."""
     scan_result = _run_cli("scan", str(EXAMPLES_DIR), "-o", str(EXAMPLES_DIR / "scan_results.jsonl"))
     assert scan_result.returncode == 0
 
@@ -179,7 +174,6 @@ def test_validate_without_analyze():
 
 @pytest.mark.skipif(not _is_api_key_set(), reason="OPENAI_API_KEY not set")
 def test_full_pipeline_with_ai():
-    """Run full pipeline including AI classification (requires API key)."""
     from auditkit.pipeline import run as pipeline_run
 
     settings = Settings()
@@ -194,7 +188,6 @@ def test_full_pipeline_with_ai():
 
 @pytest.mark.skipif(not _is_api_key_set(), reason="OPENAI_API_KEY not set")
 def test_full_pipeline_with_injection_agent():
-    """Run full pipeline using the injection agent skeleton (requires API key)."""
     from auditkit.pipeline import run as pipeline_run
 
     settings = Settings()
@@ -211,8 +204,7 @@ def test_full_pipeline_with_injection_agent():
 
 
 def test_agent_profiles_have_correct_rules():
-    """Verify agent profiles configure correct rules for each provider."""
-    from auditkit.providers import AGENT_PROFILES
+    from auditkit.scanner import AGENT_PROFILES
 
     cred = AGENT_PROFILES["credential"]
     assert cred["ruff"] == {"rules": ["S105", "S106", "S107"]}
@@ -222,14 +214,15 @@ def test_agent_profiles_have_correct_rules():
     inj = AGENT_PROFILES["injection"]
     assert "ruff" in inj
     assert "bandit" in inj
-    assert "S602" in inj["ruff"]["rules"]  # subprocess injection
+    assert "S602" in inj["ruff"]["rules"]
 
     dep = AGENT_PROFILES["dependency"]
     assert dep == {}
 
 
 def test_provider_instantiation_with_rules():
-    from auditkit.providers import BanditProvider, RuffProvider
+    from auditkit.scanner.bandit import BanditProvider
+    from auditkit.scanner.ruff import RuffProvider
 
     rp = RuffProvider(".", rules=["S105"])
     assert rp.rules == ["S105"]
@@ -240,8 +233,7 @@ def test_provider_instantiation_with_rules():
 
 
 def test_create_providers_factory():
-    """Verify create_providers uses lazy imports and returns correct providers."""
-    from auditkit.providers import AGENT_PROFILES, create_providers
+    from auditkit.scanner import AGENT_PROFILES, create_providers
 
     cred_providers = create_providers(".")
     assert len(cred_providers) == len(AGENT_PROFILES["credential"])
@@ -259,7 +251,6 @@ def test_create_providers_factory():
 
 
 def test_scan_with_injection_agent():
-    """Scan with injection agent — should use injection-specific tools (no detect-secrets)."""
     result = _run_cli("scan", str(EXAMPLES_DIR), "--agent", "injection", "-o", str(EXAMPLES_DIR / "scan_results.jsonl"))
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
 
@@ -274,13 +265,10 @@ def test_scan_with_injection_agent():
 
 
 def test_provider_uses_default_rules_when_none():
-    from auditkit.providers import RuffProvider
+    from auditkit.scanner.ruff import RuffProvider
 
     rp = RuffProvider(".", rules=[])
     assert rp.rules == []
-
-
-# ── CLI entry point ───────────────────────────────────────────────────
 
 
 if __name__ == "__main__":

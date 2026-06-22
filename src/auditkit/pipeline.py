@@ -1,15 +1,4 @@
-"""Central orchestrator for the security scanner pipeline.
-
-Phases:
-  1. producers    → RawFinding[] (scan directory with CLI tools)
-  2. report_gen   → ContextBlock[] → merge → markdown report saved to disk
-  3. agent        → classify ContextBlocks in batches → ScanReport[]
-  4. merge + save → append agent analysis to markdown + validate
-
-All I/O and subprocess calls are async under the hood.  The `run()` async
-function can be called from tests with asyncio.run().  The Typer `main()`
-command wraps it with asyncio.run().  Settings are created freshly per
-invocation (no global singleton).
+"""Central orchestrator — scan → report → classify → validate.
 
 Usage:
   uv run python -m auditkit.pipeline <directory>
@@ -23,17 +12,13 @@ from pathlib import Path
 
 import typer
 
-from auditkit.agents import get_agent, merge_reports
-from auditkit.agents.runner import classify_batch
+from auditkit.classifier import get_agent, merge_reports
+from auditkit.classifier.runner import classify_batch
 from auditkit.config import Settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
-from auditkit.providers import AGENT_PROFILES, create_providers
-from auditkit.report_generator import (
-    append_analysis_to_markdown,
-    build_context_blocks,
-    build_markdown_report,
-    merge_context_blocks,
-)
+from auditkit.reporter.context import build_context_blocks, merge_context_blocks
+from auditkit.reporter.markdown import append_analysis_to_markdown, build_markdown_report
+from auditkit.scanner import AGENT_PROFILES, create_providers, filter_provider_names
 from auditkit.validator import (
     validate_counts,
     validate_cross_reference,
@@ -42,25 +27,6 @@ from auditkit.validator import (
 )
 
 app = typer.Typer(no_args_is_help=True)
-
-
-def _filter_provider_names(select: str | None, exclude: str | None, agent: str) -> list[str]:
-    """Apply --select / --exclude filters to provider names for a given agent."""
-    available = set(AGENT_PROFILES.get(agent, {}))
-    selected = {s.strip() for s in select.split(",")} if select else None
-    excluded = {s.strip() for s in exclude.split(",")} if exclude else set()
-
-    if selected is not None and excluded:
-        print("Error: --select and --exclude are mutually exclusive.", file=sys.stderr)
-        raise typer.Exit(2)
-
-    if selected is not None:
-        invalid = selected - available
-        if invalid:
-            print(f"Unknown tool(s): {', '.join(sorted(invalid))}", file=sys.stderr)
-            raise typer.Exit(2)
-        return [n for n in available if n in selected]
-    return [n for n in available if n not in excluded]
 
 
 async def run(
@@ -81,13 +47,13 @@ async def run(
         raise typer.Exit(2)
 
     try:
-        agent = get_agent(agent_name).create()
+        agent = get_agent(agent_name)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise typer.Exit(2) from e
 
-    # ── Phase 1: producers (scan) ──────────────────────────────────
-    names = _filter_provider_names(select, exclude, agent_name)
+    # ── Phase 1: scan ──────────────────────────────────────────────
+    names = filter_provider_names(select, exclude, agent_name)
     if not names:
         print("No tools selected — nothing to run.", file=sys.stderr)
         return None
@@ -110,7 +76,7 @@ async def run(
         print("No security issues found.")
         return None
 
-    # ── Phase 1b: persist JSONL for validation ────────────────────
+    # ── Save JSONL ─────────────────────────────────────────────────
     tools_used = sorted({f.tool_name for f in all_findings})
     blocks = await build_context_blocks(all_findings)
     merged_blocks = await merge_context_blocks(blocks)
@@ -123,7 +89,7 @@ async def run(
     )
     print(f"JSONL saved: {jsonl_path} ({len(entries)} entries)")
 
-    # ── Phase 2: report generator ─────────────────────────────────
+    # ── Phase 2: report ────────────────────────────────────────────
     md_path = dir_path / f"{agent_name}_scan_report.md"
     md_content = build_markdown_report(merged_blocks, str(directory), tools_used, agent_name=agent_name)
     await asyncio.to_thread(md_path.write_text, md_content, encoding="utf-8")
@@ -132,7 +98,7 @@ async def run(
     print(f"  Context blocks (merged): {len(merged_blocks)}")
     print(f"  Total findings: {len(entries)}")
 
-    # ── Phase 3: agent classifier (batched) ───────────────────────
+    # ── Phase 3: classify (batched) ────────────────────────────────
     files_flagged = list(dict.fromkeys(f.file_path for f in all_findings))
     batch_size = agent.batch_size
     batches = [files_flagged[i : i + batch_size] for i in range(0, len(files_flagged), batch_size)]
@@ -158,7 +124,7 @@ async def run(
             f"false_positives={report.false_positives}"
         )
 
-    # ── Phase 4: merge + save ─────────────────────────────────────
+    # ── Phase 4: merge + save ──────────────────────────────────────
     final = merge_reports(reports, str(directory))
     await append_analysis_to_markdown(str(md_path), final)
     print(f"\nAgent analysis appended to: {md_path}")
@@ -180,17 +146,16 @@ async def run(
     print(f"  False positives: {final.false_positives}")
     print(f"\nFull report: {md_path}")
 
-    # ── Phase 5: validate ─────────────────────────────────────────
+    # ── Phase 5: validate ──────────────────────────────────────────
     print(f"\n{'─' * 60}")
     print("VALIDATION")
     print(f"{'─' * 60}")
-    await _run_validation(entries, final, md_path)
+    await _run_validation(entries, final, md_path, agent_name)
 
     return str(md_path)
 
 
-async def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path: Path) -> None:
-    """Inline validation — exits with code 1 if any checks fail."""
+async def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path: Path, agent_name: str) -> None:
     all_errors: list[str] = []
 
     def check(name: str, errors: list[str]) -> bool:
@@ -206,7 +171,7 @@ async def _run_validation(entries: list[ScanEntry], report: ScanReport, md_path:
     all_ok = True
     all_ok &= check("Internal counts", validate_counts(report))
     all_ok &= check("Cross-reference (scan ↔ analyze)", validate_cross_reference(entries, report))
-    all_ok &= check("Markdown structure", await validate_markdown(md_path, report))
+    all_ok &= check("Markdown structure", await validate_markdown(md_path, report, agent_name))
     all_ok &= check("File paths existence", await validate_paths(entries))
 
     if all_ok:
