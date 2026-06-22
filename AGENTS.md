@@ -29,6 +29,10 @@ uv run python -m auditkit.cli validate <jsonl_file> -a analyze_results.json -r r
 uv run python -m auditkit.cli scan . --agent credential --select ruff,detect-secrets
 uv run python -m auditkit.cli scan . --agent credential --exclude bandit
 
+# Health check — verifies each provider's CLI tool is installed and working
+uv run python -m auditkit.cli check
+uv run python -m auditkit.cli check --agent credential
+
 # Run integration tests
 uv run python -m pytest tests/ -v
 ```
@@ -39,6 +43,11 @@ uv run python -m pytest tests/ -v
 cp .env.example .env    # then edit .env with OPENAI_API_KEY
 uv sync
 uv run pre-commit install
+
+# Or install with only specific agent's tools via optional-dependencies:
+pip install "auditkit[credential]"
+pip install "auditkit[injection]"
+pip install "auditkit[all]"
 ```
 
 Required env vars: `OPENAI_API_KEY`. Optional: `OPENAI_BASE_URL` (defaults to the official OpenAI endpoint), `OPENAI_MODEL` (default `gpt-4o`), `OPENAI_MODEL_LIGHT` (default `gpt-4o-mini`), `OPENAI_DEFAULT_AGENT` (default `credential`). Loaded via `auditkit/config.py` (pydantic-settings from `.env`). Each Typer command calls `Settings()` directly — no global singleton.
@@ -65,7 +74,7 @@ src/auditkit/
     runner.py         # classify_batch() — shared LLM execution via pydantic-ai
     prompts.py        # AGENTS dict: system_prompts + get_agent() + list_agents()
 
-  cli.py              # Typer app: scan, report, analyze, validate commands
+  cli.py              # Typer app: scan, report, analyze, validate, check commands
   pipeline.py         # Orchestrator: scan → report → classify → validate
   validator.py        # Async report validation: counts, cross-reference, markdown structure, file paths
 ```
@@ -75,18 +84,21 @@ src/auditkit/
 - **Flat pipeline flow**: `scanner/` → `reporter/` → `classifier/` reflects the actual execution sequence. No architectural layering that doesn't correspond to real phases.
 - **No ABC for agents**: Agents are `AgentConfig` instances (dataclass-like) with `name`, `description`, `system_prompt`, and `batch_size`. The `SecurityAgent` ABC and its class hierarchy were removed — the only variation between agents was their prompt, which is now a dictionary entry in `prompts.py`.
 - **No dead wrappers**: `producers.py` and `agent_classifier.py` were removed — they only re-exported or delegated without adding logic.
-- **Provider abstraction**: `BaseCredentialProvider` ABC with `async def generate_audit_records() -> AsyncGenerator[RawFinding]`. New providers subclass it and register in `PROVIDER_REGISTRY`.
+- **Provider abstraction**: `BaseCredentialProvider` ABC with `async def generate_audit_records() -> AsyncGenerator[RawFinding]` and `async def healthy() -> tuple[bool, str]`. Each provider implements `healthy()` by running the tool's version command. New providers subclass it and register in `PROVIDER_REGISTRY`.
 - **JSONL as interchange format**: `scan` writes `scan_results.jsonl`, `report`/`analyze`/`validate` read it.
 - **Block merging**: `merge_context_blocks()` consolidates overlapping (±2 line gap) context blocks from different tools. Same-line findings from ruff + bandit + detect-secrets appear in one merged block with multiple `>>>` markers.
 - **Normalized paths**: `_normalize_path()` converts all tool output paths to relative paths from cwd.
 - **Agent profiles**: `AGENT_PROFILES` dict maps agent names (e.g. `"credential"`, `"injection"`, `"dependency"`) to per-provider kwargs. `create_providers(dir, agent)` factory instantiates all providers.
 - **Async everywhere**: All I/O (subprocess, file reads/writes) is async. Sync Typer commands wrap async implementations with `asyncio.run()`. Providers use `asyncio.create_subprocess_exec`. File I/O uses `asyncio.to_thread`.
 - **No global state**: `Settings()` is created per-command invocation. No global singleton, no DI container.
+- **Health check on creation**: `create_providers()` calls each provider's `healthy()` before returning. If the CLI tool is missing or broken, a `ProviderNotInstalledError` is raised with install instructions. The `--select` / `--exclude` scan flags still work, but missing tools now give a clear error instead of silently failing.
+- **Optional dependencies**: `[project.optional-dependencies]` groups packages per agent (`credential`, `injection`, `dependency`, `all`) so users can `pip install auditkit[credential]`.
+- **Check CLI commands**: `auditkit check` runs `healthy()` on all providers and reports status.
 - **Simplified CLI**: Commands are silent on success. Output goes to stdout/JSONL. Errors are logged to stderr as structured JSON.
 
 ## Adding a new scanner tool
 
-1. Create `scanner/yourtool.py` — subclass `BaseCredentialProvider`, implement `generate_audit_records()`
+1. Create `scanner/yourtool.py` — subclass `BaseCredentialProvider`, implement `generate_audit_records()` and `healthy()`
 2. Add to `PROVIDER_REGISTRY` in `scanner/__init__.py`
 3. Add configuration in `AGENT_PROFILES` for each agent that should use the tool
 
@@ -104,3 +116,4 @@ src/auditkit/
 - `bandit` provider uses `-l -i` flags (LOW severity + LOW confidence) to include B105-B107 password rules.
 - `detect-secrets` scans all files including generated reports; scan output files may appear as false findings in subsequent scans.
 - Typer (v0.26.7) does not have a built-in `Depends` — DI is purely functional (create-and-pass).
+- `ProviderNotInstalledError` is raised at provider creation if `healthy()` fails — scan and pipeline skip the provider with a clear install message.

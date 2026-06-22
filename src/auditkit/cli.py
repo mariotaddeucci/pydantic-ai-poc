@@ -5,6 +5,7 @@ helpers with asyncio.run(). Settings created freshly per command.
 """
 
 import asyncio
+import importlib
 import json
 import sys
 import traceback
@@ -18,7 +19,13 @@ from auditkit.config import Settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
 from auditkit.reporter.context import build_context_blocks, merge_context_blocks
 from auditkit.reporter.markdown import build_markdown_report
-from auditkit.scanner import AGENT_PROFILES, create_providers, filter_provider_names
+from auditkit.scanner import (
+    AGENT_PROFILES,
+    PROVIDER_REGISTRY,
+    ProviderNotInstalledError,
+    create_providers,
+    filter_provider_names,
+)
 from auditkit.validator import (
     validate_counts,
     validate_cross_reference,
@@ -84,9 +91,12 @@ async def _scan(
     all_findings: list[RawFinding] = []
     for name in names:
         try:
-            provider = create_providers(directory, agent=agent, select=[name])[0]
+            providers = await create_providers(directory, agent=agent, select=[name])
+            provider = providers[0]
             async for finding in provider.generate_audit_records():
                 all_findings.append(finding)  # noqa: PERF401
+        except ProviderNotInstalledError as e:
+            _stderr_json(warning=f"{name} not installed", install=str(e))
         except Exception as e:
             _stderr_json(warning=f"{name} skipped", reason=str(e))
 
@@ -194,6 +204,40 @@ def analyze(
     agent: str | None = typer.Option(None, "--agent", "-a", help=f"Agent. Available: {', '.join(list_agents())}"),
 ):
     _wrap_async(_analyze(jsonl_file, directory, agent))
+
+
+# ── Check ──────────────────────────────────────────────────────────────
+
+
+async def _check_health(agent: str | None) -> None:
+    names = list(AGENT_PROFILES.get(agent, {})) if agent else sorted(PROVIDER_REGISTRY)
+
+    if not names:
+        print("No providers to check.")
+        return
+
+    for name in names:
+        spec = PROVIDER_REGISTRY.get(name)
+        if not spec:
+            continue
+        mod = importlib.import_module(spec["module"])
+        cls = getattr(mod, spec["class_name"])
+        provider = cls(".", rules=[])
+
+        try:
+            ok, detail = await provider.healthy()
+            status = "\u2713" if ok else "\u2717"
+            print(f"  {status} {name}: {detail}")
+        except Exception as e:
+            print(f"  \u2717 {name}: {e}")
+
+
+@app.command()
+def check(
+    agent: str | None = typer.Option(None, "--agent", "-a", help="Agent to check, or all if omitted"),
+):
+    """Check health of scanner tools."""
+    _wrap_async(_check_health(agent))
 
 
 # ── Validate ──────────────────────────────────────────────────────────

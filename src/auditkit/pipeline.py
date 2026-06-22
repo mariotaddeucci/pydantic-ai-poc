@@ -18,7 +18,12 @@ from auditkit.config import Settings
 from auditkit.models import RawFinding, ScanEntry, ScanReport
 from auditkit.reporter.context import build_context_blocks, merge_context_blocks
 from auditkit.reporter.markdown import append_analysis_to_markdown, build_markdown_report
-from auditkit.scanner import AGENT_PROFILES, create_providers, filter_provider_names
+from auditkit.scanner import (
+    AGENT_PROFILES,
+    ProviderNotInstalledError,
+    create_providers,
+    filter_provider_names,
+)
 from auditkit.validator import (
     validate_counts,
     validate_cross_reference,
@@ -62,14 +67,17 @@ async def run(
     for name in names:
         print(f"  Running {name}...")
         try:
-            provider = create_providers(directory, agent=agent_name, select=[name])[0]
+            providers = await create_providers(directory, agent=agent_name, select=[name])
+            provider = providers[0]
             count = 0
             async for finding in provider.generate_audit_records():
                 all_findings.append(finding)
                 count += 1
             print(f"    {count} finding(s)")
-        except Exception as e:
+        except ProviderNotInstalledError as e:
             print(f"    Skipped: {e}")
+        except Exception as e:
+            print(f"    Error: {e}")
 
     print(f"\nTotal raw findings: {len(all_findings)}")
     if not all_findings:

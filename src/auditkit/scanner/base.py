@@ -33,6 +33,12 @@ class BaseCredentialProvider(ABC):
         self.rules = rules or []
 
     @abstractmethod
-    async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
-        if False:
-            yield
+    async def healthy(self) -> tuple[bool, str]:
+        """Check if the underlying CLI tool is installed and functional.
+
+        Returns (ok, version_or_error_detail).
+        """
+        ...
+
+    @abstractmethod
+    async def generate_audit_records(self) -> AsyncGenerator[RawFinding]: ...

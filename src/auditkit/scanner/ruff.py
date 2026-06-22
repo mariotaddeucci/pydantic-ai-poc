@@ -26,6 +26,23 @@ RUFF_DEFAULT_RULES = ["S105", "S106", "S107"]
 
 
 class RuffProvider(BaseCredentialProvider):
+    async def healthy(self) -> tuple[bool, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "ruff",
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return True, stdout.decode().strip().split("\n")[0]
+            return False, stderr.decode().strip()
+        except FileNotFoundError:
+            return False, "ruff executable not found"
+
     async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
         rules_to_run = self.rules if self.rules else RUFF_DEFAULT_RULES
         rules = ",".join(rules_to_run)

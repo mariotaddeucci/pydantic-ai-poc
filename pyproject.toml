@@ -10,6 +10,23 @@ dependencies = [
     "typer>=0.25.1",
 ]
 
+[project.optional-dependencies]
+all = [
+    "ruff>=0.15.18",
+    "bandit>=1.9.4",
+    "detect-secrets>=1.5.0",
+]
+credential = [
+    "ruff>=0.15.18",
+    "bandit>=1.9.4",
+    "detect-secrets>=1.5.0",
+]
+injection = [
+    "ruff>=0.15.18",
+    "bandit>=1.9.4",
+]
+dependency = []
+
 [dependency-groups]
 dev = [
     "bandit>=1.9.4",
@@ -78,7 +95,7 @@ known-first-party = ["auditkit"]
 "src/auditkit/validator.py" = ["TC001"]
 "src/auditkit/reporter/*.py" = []
 "src/auditkit/classifier/runner.py" = ["TC001"]
-"src/auditkit/cli.py" = ["PLR0912", "SIM115", "PLR0913", "TC001", "ASYNC240"]
+"src/auditkit/cli.py" = ["PLR0912", "SIM115", "PLR0913", "TC001", "ASYNC240", "T201"]
 "tests/test_integration.py" = ["S", "T20", "PLR2004", "PLR0913", "ARG", "PLW1510", "PLC0415", "TC003"]
 "tests/fixtures/**/*.py" = ["T20", "F541", "PLC0415"]
 

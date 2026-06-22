@@ -232,20 +232,20 @@ def test_provider_instantiation_with_rules():
     assert bp.rules == ["B105", "B301"]
 
 
-def test_create_providers_factory():
+async def test_create_providers_factory():
     from auditkit.scanner import AGENT_PROFILES, create_providers
 
-    cred_providers = create_providers(".")
+    cred_providers = await create_providers(".", skip_health_check=True)
     assert len(cred_providers) == len(AGENT_PROFILES["credential"])
     assert all(p.rules is not None for p in cred_providers)
 
-    inj_providers = create_providers(".", agent="injection")
+    inj_providers = await create_providers(".", agent="injection", skip_health_check=True)
     assert len(inj_providers) == len(AGENT_PROFILES["injection"])
 
-    dep_providers = create_providers(".", agent="dependency")
+    dep_providers = await create_providers(".", agent="dependency", skip_health_check=True)
     assert len(dep_providers) == 0
 
-    selected = create_providers(".", agent="credential", select=["ruff"])
+    selected = await create_providers(".", agent="credential", select=["ruff"], skip_health_check=True)
     assert len(selected) == 1
     assert "ruff" in type(selected[0]).__name__.lower()
 
@@ -269,6 +269,57 @@ def test_provider_uses_default_rules_when_none():
 
     rp = RuffProvider(".", rules=[])
     assert rp.rules == []
+
+
+# ── Health check tests ────────────────────────────────────────────────
+
+
+async def test_ruff_healthy():
+    from auditkit.scanner.ruff import RuffProvider
+
+    provider = RuffProvider(".")
+    ok, detail = await provider.healthy()
+    assert ok, f"ruff should be healthy: {detail}"
+    assert "ruff" in detail.lower()
+
+
+async def test_bandit_healthy():
+    from auditkit.scanner.bandit import BanditProvider
+
+    provider = BanditProvider(".")
+    ok, detail = await provider.healthy()
+    assert ok, f"bandit should be healthy: {detail}"
+    assert "bandit" in detail.lower()
+
+
+async def test_detect_secrets_healthy():
+    from auditkit.scanner.detect_secrets import DetectSecretsProvider
+
+    provider = DetectSecretsProvider(".")
+    ok, detail = await provider.healthy()
+    assert ok, f"detect-secrets should be healthy: {detail}"
+    assert len(detail) > 0
+
+
+async def test_create_providers_with_health_check():
+    from auditkit.scanner import create_providers
+
+    providers = await create_providers(".", agent="credential", select=["ruff"], skip_health_check=False)
+    assert len(providers) == 1
+    ok, _ = await providers[0].healthy()
+    assert ok
+
+
+# ── ProviderNotInstalledError ─────────────────────────────────────────
+
+
+def test_provider_not_installed_error_message():
+    from auditkit.scanner import ProviderNotInstalledError
+
+    err = ProviderNotInstalledError("ruff", "No module named ruff")
+    assert "ruff" in str(err)
+    assert "No module named ruff" in str(err)
+    assert isinstance(err, RuntimeError)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,22 @@ from auditkit.scanner.base import BaseCredentialProvider, _is_ignored, _normaliz
 
 
 class DetectSecretsProvider(BaseCredentialProvider):
+    async def healthy(self) -> tuple[bool, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import detect_secrets",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return True, "detect_secrets available"
+            return False, stderr.decode().strip()
+        except FileNotFoundError:
+            return False, "detect_secrets not found"
+
     async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,

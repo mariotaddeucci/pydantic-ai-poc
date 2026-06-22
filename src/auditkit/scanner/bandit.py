@@ -10,6 +10,23 @@ BANDIT_DEFAULT_RULES = ["B105", "B106", "B107"]
 
 
 class BanditProvider(BaseCredentialProvider):
+    async def healthy(self) -> tuple[bool, str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "bandit",
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return True, stdout.decode().strip().split("\n")[0]
+            return False, stderr.decode().strip()
+        except FileNotFoundError:
+            return False, "bandit executable not found"
+
     async def generate_audit_records(self) -> AsyncGenerator[RawFinding]:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,

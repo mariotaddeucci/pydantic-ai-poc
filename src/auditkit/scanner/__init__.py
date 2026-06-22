@@ -29,6 +29,14 @@ AGENT_PROFILES: dict[str, dict[str, dict[str, list[str]]]] = {
 }
 
 
+class ProviderNotInstalledError(RuntimeError):
+    """Raised when a provider's CLI tool is not installed or not functional."""
+
+    def __init__(self, provider_name: str, health_detail: str):
+        self.provider_name = provider_name
+        super().__init__(f"{provider_name} not available: {health_detail}")
+
+
 def filter_provider_names(select: str | None, exclude: str | None, agent: str) -> list[str]:
     """Apply --select / --exclude filters to provider names for a given agent."""
     available = set(AGENT_PROFILES.get(agent, {}))
@@ -49,14 +57,18 @@ def filter_provider_names(select: str | None, exclude: str | None, agent: str) -
     return [n for n in available if n not in excluded]
 
 
-def create_providers(
+async def create_providers(
     directory: str,
     agent: str = "credential",
     select: list[str] | None = None,
+    skip_health_check: bool = False,
 ) -> list[BaseCredentialProvider]:
     """Instantiate providers configured for the given agent.
 
     Uses lazy imports so provider classes are loaded only on demand.
+    Runs each provider's healthy() check — raises ProviderNotInstalledError
+    if the underlying CLI tool is missing or broken. Pass skip_health_check=True
+    to bypass this validation.
     The select parameter filters by provider name.
     """
     if agent not in AGENT_PROFILES:
@@ -71,5 +83,12 @@ def create_providers(
         spec = PROVIDER_REGISTRY[provider_name]
         mod = importlib.import_module(spec["module"])
         cls = getattr(mod, spec["class_name"])
-        providers.append(cls(directory, **kwargs))
+        provider = cls(directory, **kwargs)
+
+        if not skip_health_check:
+            ok, detail = await provider.healthy()
+            if not ok:
+                raise ProviderNotInstalledError(provider_name, detail)
+
+        providers.append(provider)
     return providers
