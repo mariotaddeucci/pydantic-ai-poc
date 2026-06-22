@@ -22,7 +22,6 @@ from auditkit.scanner import (
     AGENT_PROFILES,
     ProviderNotInstalledError,
     create_providers,
-    filter_provider_names,
 )
 from auditkit.validator import (
     validate_counts,
@@ -38,8 +37,6 @@ async def run(
     directory: str,
     settings: Settings,
     agent_name: str = "credential",
-    select: str | None = None,
-    exclude: str | None = None,
 ) -> str | None:
     """Run the full pipeline. Returns path to markdown report or None if clean."""
     dir_path = Path(directory).resolve()
@@ -58,9 +55,9 @@ async def run(
         raise typer.Exit(2) from e
 
     # ── Phase 1: scan ──────────────────────────────────────────────
-    names = filter_provider_names(select, exclude, agent_name)
+    names = list(AGENT_PROFILES.get(agent_name, {}))
     if not names:
-        print("No tools selected — nothing to run.", file=sys.stderr)
+        print("No tools configured for this agent.", file=sys.stderr)
         return None
 
     all_findings: list[RawFinding] = []
@@ -197,8 +194,6 @@ def main(
         "-a",
         help=f"Agent context. Available: {', '.join(sorted(AGENT_PROFILES))}",
     ),
-    select: str | None = typer.Option(None, "--select", help="Comma-separated tool names to run (default: all)"),
-    exclude: str | None = typer.Option(None, "--exclude", help="Comma-separated tool names to skip (default: none)"),
 ) -> None:
     """Run the full security scan pipeline."""
     settings = Settings()
@@ -210,7 +205,7 @@ def main(
 
     agent_name = agent or settings.openai_default_agent
     print(f"Scanning directory: {directory}")
-    asyncio.run(run(directory, settings, agent_name=agent_name, select=select, exclude=exclude))
+    asyncio.run(run(directory, settings, agent_name=agent_name))
 
 
 if __name__ == "__main__":

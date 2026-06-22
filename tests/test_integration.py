@@ -107,32 +107,6 @@ def test_scan_all_tools():
     assert "detect-secrets" in tools, f"detect-secrets not in tools: {tools}"
 
 
-def test_scan_only_ruff():
-    result = _run_cli("scan", str(EXAMPLES_DIR), "--select", "ruff", "-o", str(EXAMPLES_DIR / "scan_results.jsonl"))
-    assert result.returncode == 0, f"stderr:\n{result.stderr}"
-
-    jsonl_path = EXAMPLES_DIR / "scan_results.jsonl"
-    with open(jsonl_path, encoding="utf-8") as f:
-        findings = [json.loads(raw_line) for raw_line in f if raw_line.strip()]
-
-    tools = {e["finding"]["tool_name"] for e in findings}
-    assert tools == {"ruff"}, f"Expected only ruff, got {tools}"
-
-
-def test_scan_exclude_bandit():
-    result = _run_cli("scan", str(EXAMPLES_DIR), "--exclude", "bandit", "-o", str(EXAMPLES_DIR / "scan_results.jsonl"))
-    assert result.returncode == 0, f"stderr:\n{result.stderr}"
-
-    jsonl_path = EXAMPLES_DIR / "scan_results.jsonl"
-    with open(jsonl_path, encoding="utf-8") as f:
-        findings = [json.loads(raw_line) for raw_line in f if raw_line.strip()]
-
-    tools = {e["finding"]["tool_name"] for e in findings}
-    assert "bandit" not in tools, f"bandit should be excluded, got {tools}"
-    assert "ruff" in tools
-    assert "detect-secrets" in tools
-
-
 # ── Phase 2: report ──────────────────────────────────────────────────
 
 

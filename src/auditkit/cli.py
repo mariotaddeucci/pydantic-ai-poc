@@ -24,7 +24,6 @@ from auditkit.scanner import (
     PROVIDER_REGISTRY,
     ProviderNotInstalledError,
     create_providers,
-    filter_provider_names,
 )
 from auditkit.validator import (
     validate_counts,
@@ -76,17 +75,13 @@ def _wrap_async(coro):
 async def _scan(
     directory: str,
     output: str | None,
-    select: str | None,
-    exclude: str | None,
     agent: str,
 ) -> None:
     if agent not in AGENT_PROFILES:
         _stderr_json(error=f"Unknown agent '{agent}'", available=sorted(AGENT_PROFILES))
         raise typer.Exit(2)
 
-    names = filter_provider_names(select, exclude, agent)
-    if not names:
-        return
+    names = list(AGENT_PROFILES[agent])
 
     all_findings: list[RawFinding] = []
     for name in names:
@@ -116,8 +111,6 @@ async def _scan(
 def scan(
     directory: str = typer.Argument(".", help="Directory to scan"),
     output: str | None = typer.Option(None, "--output", "-o", help="JSONL output path"),
-    select: str | None = typer.Option(None, "--select", help="Comma-separated tools to run"),
-    exclude: str | None = typer.Option(None, "--exclude", help="Comma-separated tools to skip"),
     agent: str = typer.Option(
         "credential",
         "--agent",
@@ -125,7 +118,7 @@ def scan(
         help=f"Agent profile. Available: {', '.join(sorted(AGENT_PROFILES))}",
     ),
 ):
-    _wrap_async(_scan(directory, output, select, exclude, agent))
+    _wrap_async(_scan(directory, output, agent))
 
 
 # ── Report ────────────────────────────────────────────────────────────

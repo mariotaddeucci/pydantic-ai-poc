@@ -25,10 +25,6 @@ uv run python -m auditkit.pipeline <dir> --agent injection
 # Validate report integrity
 uv run python -m auditkit.cli validate <jsonl_file> -a analyze_results.json -r report.md
 
-# Scan with only specific tools (filtered from the agent's providers)
-uv run python -m auditkit.cli scan . --agent credential --select ruff,detect-secrets
-uv run python -m auditkit.cli scan . --agent credential --exclude bandit
-
 # Health check — verifies each provider's CLI tool is installed and working
 uv run python -m auditkit.cli check
 uv run python -m auditkit.cli check --agent credential
