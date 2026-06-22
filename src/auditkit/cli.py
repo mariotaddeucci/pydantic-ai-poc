@@ -204,10 +204,7 @@ def analyze(
 
 async def _check_health(agent: str | None) -> None:
     names = list(AGENT_PROFILES.get(agent, {})) if agent else sorted(PROVIDER_REGISTRY)
-
-    if not names:
-        print("No providers to check.")
-        return
+    results: dict[str, dict[str, object]] = {}
 
     for name in names:
         spec = PROVIDER_REGISTRY.get(name)
@@ -219,10 +216,13 @@ async def _check_health(agent: str | None) -> None:
 
         try:
             ok, detail = await provider.healthy()
-            status = "\u2713" if ok else "\u2717"
-            print(f"  {status} {name}: {detail}")
+            results[name] = {"ok": ok, "detail": detail}
         except Exception as e:
-            print(f"  \u2717 {name}: {e}")
+            results[name] = {"ok": False, "detail": str(e)}
+
+    sys.stdout.write(json.dumps(results, ensure_ascii=False) + "\n")
+    if any(not v["ok"] for v in results.values()):
+        raise typer.Exit(1)
 
 
 @app.command()
